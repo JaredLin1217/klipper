@@ -396,7 +396,7 @@ class ConfigAutoSave:
             key=os.path.getmtime,
             reverse=True
         )
-        for old_backup in backup_files[0:]:  #4 就是5份
+        for old_backup in backup_files[4:]:  #4 就是5份
             try:
                 os.remove(old_backup)
             except Exception as e:
