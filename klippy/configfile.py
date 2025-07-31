@@ -388,7 +388,7 @@ class ConfigAutoSave:
         datestr = time.strftime("-%Y%m%d_%H%M%S")
         backup_name = cfgname + datestr
         temp_name = cfgname + "_autosave"
-        #jared 🔽 新增：清理舊備份（只保留 1 份）
+        #jared 🔽 新增：清理舊備份（只保留 5 份）
         import glob
         cfg_prefix = cfgname[:-4]
         backup_files = sorted(
@@ -396,7 +396,7 @@ class ConfigAutoSave:
             key=os.path.getmtime,
             reverse=True
         )
-        for old_backup in backup_files[0:]:  #0 就是1份
+        for old_backup in backup_files[0:]:  #4 就是5份
             try:
                 os.remove(old_backup)
             except Exception as e:
