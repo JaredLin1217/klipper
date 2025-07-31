@@ -382,6 +382,21 @@ class ConfigAutoSave:
         datestr = time.strftime("-%Y%m%d_%H%M%S")
         backup_name = cfgname + datestr
         temp_name = cfgname + "_autosave"
+        #jared
+        # 🔽 新增：清理舊備份（只保留 1 份）
+        import glob
+        cfg_prefix = cfgname[:-4]
+        backup_files = sorted(
+            glob.glob(cfg_prefix + "-*.cfg"),
+            key=os.path.getmtime,
+            reverse=True
+        )
+        for old_backup in backup_files[1:]:
+            try:
+                os.remove(old_backup)
+            except Exception as e:
+                logging.warning("Failed to remove old backup %s: %s", old_backup, e)
+        #
         if cfgname.endswith(".cfg"):
             backup_name = cfgname[:-4] + datestr + ".cfg"
             temp_name = cfgname[:-4] + "_autosave.cfg"
@@ -399,8 +414,9 @@ class ConfigAutoSave:
             logging.exception(msg)
             raise gcmd.error(msg)
         # Request a restart
-        gcode = self.printer.lookup_object('gcode')
-        gcode.request_restart('restart')
+        #jared
+        #gcode = self.printer.lookup_object('gcode')
+        #gcode.request_restart('restart')
 
 
 ######################################################################
