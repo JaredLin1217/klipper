@@ -342,80 +342,108 @@ class ConfigAutoSave:
                     msg = ("SAVE_CONFIG section '%s' option '%s' conflicts "
                            "with included value" % (section, option))
                     raise self.printer.command_error(msg)
-    cmd_SAVE_CONFIG_help = "Overwrite config file and restart"
+                    
+    cmd_SAVE_CONFIG_help = "Backup current config, then overwrite printer.cfg"
     def cmd_SAVE_CONFIG(self, gcmd):
         if not self.fileconfig.sections():
             return
-        # Create string containing autosave data
+        # 產生 autosave 區塊文字
         cfgrdr = ConfigFileReader()
         autosave_data = cfgrdr.build_config_string(self.fileconfig)
-        lines = [('#*# ' + l).strip()
-                 for l in autosave_data.split('\n')]
+        lines = [('#*# ' + l).strip() for l in autosave_data.split('\n')]
         lines.insert(0, "\n" + AUTOSAVE_HEADER.rstrip())
         lines.append("")
         autosave_data = '\n'.join(lines)
-        # Read in and validate current config file
+
+        # 讀取目前主檔（備份會用它的原始內容）
         cfgname = self.printer.get_start_args()['config_file']
         try:
             data = cfgrdr.read_config_file(cfgname)
-        except error as e:
+        except error:
             msg = "Unable to read existing config on SAVE_CONFIG"
             logging.exception(msg)
             raise gcmd.error(msg)
-        regular_data, old_autosave_data = self._find_autosave_data(data)
+
+        original_data = data  # 備份用
+
+        # 清掉舊 autosave、去除重複鍵，組出「新檔內容」
+        regular_data, _old_autosave_data = self._find_autosave_data(data)
         regular_data = self._strip_duplicates(regular_data, self.fileconfig)
-        data = regular_data.rstrip() + autosave_data
-        new_regular_data, new_autosave_data = self._find_autosave_data(data)
+        new_data = regular_data.rstrip() + autosave_data
+
+        # 確認 autosave 區塊構造正確
+        _new_regular_data, new_autosave_data = self._find_autosave_data(new_data)
         if not new_autosave_data:
             raise gcmd.error(
-                "Existing config autosave is corrupted."
-                " Can't complete SAVE_CONFIG")
+                "Existing config autosave is corrupted. Can't complete SAVE_CONFIG")
+
+        # 解析 regular 區（含 include），並檢查與 autosave 欄位是否衝突
         try:
             regular_fileconfig = cfgrdr.build_fileconfig_with_includes(
-                new_regular_data, cfgname)
-        except error as e:
+                regular_data, cfgname)
+        except error:
             msg = "Unable to parse existing config on SAVE_CONFIG"
             logging.exception(msg)
             raise gcmd.error(msg)
         self._disallow_include_conflicts(regular_fileconfig)
-        # Determine filenames
+
+        # 決定備份檔名（不搬主檔）
         datestr = time.strftime("-%Y%m%d_%H%M%S")
-        backup_name = cfgname + datestr
-        temp_name = cfgname + "_autosave"
-        #jared 🔽 新增：清理舊備份（只保留 5 份）
-        import glob
-        cfg_prefix = cfgname[:-4]
-        backup_files = sorted(
-            glob.glob(cfg_prefix + "-*.cfg"),
-            key=os.path.getmtime,
-            reverse=True
-        )
-        for old_backup in backup_files[4:]:  #4 就是5份
-            try:
-                os.remove(old_backup)
-            except Exception as e:
-                logging.warning("Failed to remove old backup %s: %s", old_backup, e)
-        #
         if cfgname.endswith(".cfg"):
             backup_name = cfgname[:-4] + datestr + ".cfg"
-            temp_name = cfgname[:-4] + "_autosave.cfg"
-        # Create new config file with temporary name and swap with main config
-        logging.info("SAVE_CONFIG to '%s' (backup in '%s')",
+            cfg_prefix = cfgname[:-4]
+            backup_glob = cfg_prefix + "-*.cfg"
+        else:
+            backup_name = cfgname + datestr
+            cfg_prefix = cfgname
+            backup_glob = cfg_prefix + "-*"
+
+        # 清理舊備份（保留最新 5 份）
+        import glob
+        try:
+            backup_files = sorted(
+                glob.glob(backup_glob),
+                key=os.path.getmtime,
+                reverse=True
+            )
+            for old_backup in backup_files[4:]:
+                try:
+                    os.remove(old_backup)
+                except Exception as e:
+                    logging.warning("Failed to remove old backup %s: %s",
+                                    old_backup, e)
+        except Exception as e:
+            logging.warning("Failed to enumerate backups via glob '%s': %s",
+                            backup_glob, e)
+
+        # 1) 先寫備份（完全拷貝目前主檔內容）
+        try:
+            with open(backup_name, 'w') as bf:
+                bf.write(original_data)
+                bf.flush()
+                os.fsync(bf.fileno())
+        except Exception:
+            msg = "Unable to write backup file during SAVE_CONFIG"
+            logging.exception(msg)
+            raise gcmd.error(msg)
+
+        # 2) 再把新內容覆寫回同一個 printer.cfg（不搬動、不改名）
+        logging.info("SAVE_CONFIG updating '%s' (backup in '%s')",
                      cfgname, backup_name)
         try:
-            f = open(temp_name, 'w')
-            f.write(data)
-            f.close()
-            os.rename(cfgname, backup_name)
-            os.rename(temp_name, cfgname)
-        except:
+            with open(cfgname, 'w') as cf:
+                cf.write(new_data)
+                cf.flush()
+                os.fsync(cf.fileno())
+        except Exception:
             msg = "Unable to write config file during SAVE_CONFIG"
             logging.exception(msg)
             raise gcmd.error(msg)
-        # Request a restart
-        #jared
-        #gcode = self.printer.lookup_object('gcode')
-        #gcode.request_restart('restart')
+
+        # 保留你的 restart 行為（目前關閉）
+        # gcode = self.printer.lookup_object('gcode')
+        # gcode.request_restart('restart')
+
 
 
 ######################################################################
