@@ -66,7 +66,8 @@ class Heater:
         gcode = self.printer.lookup_object("gcode")
         gcode.register_mux_command("SET_HEATER_TEMPERATURE", "HEATER",
                                    short_name, self.cmd_SET_HEATER_TEMPERATURE,
-                                   desc=self.cmd_SET_HEATER_TEMPERATURE_help)
+                                   desc=self.cmd_SET_HEATER_TEMPERATURE_help,
+                                   during_temperature_wait=True)
         self.printer.register_event_handler("klippy:shutdown",
                                             self._handle_shutdown)
     def set_pwm(self, read_time, value):
@@ -254,9 +255,13 @@ class PrinterHeaters:
                                             self.turn_off_all_heaters)
         # Register commands
         gcode = self.printer.lookup_object('gcode')
-        gcode.register_command("TURN_OFF_HEATERS", self.cmd_TURN_OFF_HEATERS,
-                               desc=self.cmd_TURN_OFF_HEATERS_help)
-        gcode.register_command("M105", self.cmd_M105, when_not_ready=True)
+        gcode.register_command(
+            "TURN_OFF_HEATERS", self.cmd_TURN_OFF_HEATERS,
+            desc=self.cmd_TURN_OFF_HEATERS_help,
+            during_temperature_wait=True)
+        gcode.register_command(
+            "M105", self.cmd_M105, when_not_ready=True,
+            during_temperature_wait=True)
     def load_config(self, config):
         self.have_load_sensors = True
         # Load default temperature sensors
@@ -322,6 +327,7 @@ class PrinterHeaters:
     def turn_off_all_heaters(self, print_time=0.):
         for heater in self.heaters.values():
             heater.set_temp(0.)
+        self.printer.lookup_object('gcode').notify_temperature_wait()
     cmd_TURN_OFF_HEATERS_help = "Turn off all heaters"
     def cmd_TURN_OFF_HEATERS(self, gcmd):
         self.turn_off_all_heaters()
@@ -345,7 +351,7 @@ class PrinterHeaters:
         did_ack = gcmd.ack(msg)
         if not did_ack:
             gcmd.respond_raw(msg)
-    def _start_virtual_sd_temperature_wait(self, sensor_name, check_ready,
+    def _start_responsive_temperature_wait(self, sensor_name, check_ready,
                                            get_target):
         virtual_sd = self.printer.lookup_object('virtual_sdcard', None)
         if virtual_sd is None:
@@ -356,13 +362,14 @@ class PrinterHeaters:
         # Helper to wait on heater.check_busy() and report M105 temperatures
         if self.printer.get_start_args().get('debugoutput') is not None:
             return
-        if self._start_virtual_sd_temperature_wait(
+        toolhead = self.printer.lookup_object("toolhead")
+        toolhead.get_last_move_time()
+        if self._start_responsive_temperature_wait(
                 heater.get_name(),
                 lambda eventtime: (heater.get_temp(eventtime)[1] <= 0.
                                    or not heater.check_busy(eventtime)),
                 lambda eventtime: heater.get_temp(eventtime)[1]):
             return
-        toolhead = self.printer.lookup_object("toolhead")
         gcode = self.printer.lookup_object("gcode")
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
@@ -374,6 +381,7 @@ class PrinterHeaters:
         toolhead = self.printer.lookup_object('toolhead')
         toolhead.register_lookahead_callback((lambda pt: None))
         heater.set_temp(temp)
+        self.printer.lookup_object('gcode').notify_temperature_wait()
         if wait and temp:
             self._wait_for_temperature(heater)
     cmd_TEMPERATURE_WAIT_help = "Wait for a temperature on a sensor"
@@ -418,10 +426,11 @@ class PrinterHeaters:
                     return min_temp
                 return max_temp
 
-        if self._start_virtual_sd_temperature_wait(
+        toolhead = self.printer.lookup_object("toolhead")
+        toolhead.get_last_move_time()
+        if self._start_responsive_temperature_wait(
                 sensor_name, check_ready, get_target):
             return
-        toolhead = self.printer.lookup_object("toolhead")
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown():

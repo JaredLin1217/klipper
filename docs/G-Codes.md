@@ -822,10 +822,10 @@ temperature sensor is at or above the supplied MINIMUM and/or at or
 below the supplied MAXIMUM. `FOLLOW_TARGET=1` may be used instead of
 MINIMUM/MAXIMUM for a heater; it waits on the heater's live target so a
 target change also changes the wait condition. When enabled by the
-virtual_sdcard configuration, standalone temperature-wait lines from a
-virtual SD file do not block other G-Code sources. A wait reached from a
-different top-level macro retains its normal blocking behavior. Custom
-M109/M190/M191 wrappers must place their wait last.
+virtual_sdcard configuration, temperature waits from virtual SD files, the
+Console, and nested macros keep their current script blocked while permitting
+heater target changes, temperature queries, CANCEL_PRINT, and M112 from other
+G-Code sources. Other G-Code requests remain queued until the wait ends.
 
 #### SET_HEATER_TEMPERATURE
 `SET_HEATER_TEMPERATURE HEATER=<heater_name>

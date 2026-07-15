@@ -1655,18 +1655,19 @@ path:
 #   See docs/Command_Templates.md for G-Code format. The default is to
 #   run TURN_OFF_HEATERS.
 #cancelable_temperature_wait: False
-#   When True, standalone M109, M190, M191, and TEMPERATURE_WAIT lines
-#   dispatched from a virtual SD file stop before the next file line without
-#   entering PAUSE. The virtual SD print remains active and other G-Code
-#   sources may change heater targets or cancel the print. A wait reached
-#   from a different top-level macro, such as START_PRINT, retains the normal
-#   blocking behavior so subsequent macro commands cannot execute early.
-#   Custom M109/M190/M191 wrappers must place their wait last. The default is
-#   False.
+#   When True, M109, M190, and TEMPERATURE_WAIT commands (including M191
+#   macros implemented with TEMPERATURE_WAIT) dispatched from a virtual SD
+#   file, the Console, or a G-Code macro use a responsive wait.
+#   The current script and all nested macros remain blocked at the wait, but
+#   Mainsail may change heater targets, query temperatures, cancel the print,
+#   or issue M112. Other G-Code requests remain queued until the wait ends.
+#   Cancelling aborts the waiting script and discards requests queued during
+#   that wait. The default is False.
 #temperature_wait_check_interval: 0.25
-#   Time in seconds between virtual SD temperature checks when the above
-#   option is enabled. The valid range is greater than zero and no more than
-#   one second. The default is 0.25 seconds.
+#   Maximum time in seconds between responsive temperature checks when the
+#   above option is enabled. Heater target changes also trigger an immediate
+#   check. The valid range is greater than zero and no more than one second.
+#   The default is 0.25 seconds.
 ```
 
 ### [sdcard_loop]

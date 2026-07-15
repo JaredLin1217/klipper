@@ -8,6 +8,9 @@ import os, re, logging, collections, shlex, operator
 class CommandError(Exception):
     pass
 
+class TemperatureWaitCancelled(CommandError):
+    pass
+
 # Custom "tuple" class for coordinates - add easy access to x, y, z components
 class Coord(tuple):
     __slots__ = ()
@@ -99,8 +102,11 @@ class GCodeCommand:
 class GCodeDispatch:
     error = CommandError
     Coord = Coord
+    SCRIPT_CANCELLED = object()
+    TEMPERATURE_WAIT_NAMED_CONTROLS = frozenset(['CANCEL_PRINT'])
     def __init__(self, printer):
         self.printer = printer
+        self.reactor = printer.get_reactor()
         self.is_fileinput = not not printer.get_start_args().get("debuginput")
         printer.register_event_handler("klippy:ready", self._handle_ready)
         printer.register_event_handler("klippy:shutdown", self._handle_shutdown)
@@ -108,7 +114,9 @@ class GCodeDispatch:
                                        self._handle_disconnect)
         # Command handling
         self.is_printer_ready = False
-        self.mutex = printer.get_reactor().mutex()
+        self.mutex = self.reactor.mutex()
+        self.active_temperature_wait = None
+        self.temperature_wait_safe_handlers = set()
         self.output_callbacks = []
         self.base_gcode_handlers = self.gcode_handlers = {}
         self.ready_gcode_handlers = {}
@@ -121,7 +129,9 @@ class GCodeDispatch:
         for cmd in handlers:
             func = getattr(self, 'cmd_' + cmd)
             desc = getattr(self, 'cmd_' + cmd + '_help', None)
-            self.register_command(cmd, func, True, desc)
+            self.register_command(
+                cmd, func, True, desc,
+                during_temperature_wait=(cmd == 'M112'))
     def is_traditional_gcode(self, cmd):
         # A "traditional" g-code command is a letter and followed by a number
         try:
@@ -130,9 +140,11 @@ class GCodeDispatch:
             return cmd[0].isupper() and cmd[1].isdigit()
         except:
             return False
-    def register_command(self, cmd, func, when_not_ready=False, desc=None):
+    def register_command(self, cmd, func, when_not_ready=False, desc=None,
+                         during_temperature_wait=False):
         if func is None:
             old_cmd = self.ready_gcode_handlers.get(cmd)
+            self.temperature_wait_safe_handlers.discard(old_cmd)
             if cmd in self.ready_gcode_handlers:
                 del self.ready_gcode_handlers[cmd]
             if cmd in self.base_gcode_handlers:
@@ -150,16 +162,21 @@ class GCodeDispatch:
             origfunc = func
             func = lambda params: origfunc(self._get_extended_params(params))
         self.ready_gcode_handlers[cmd] = func
+        if during_temperature_wait:
+            self.temperature_wait_safe_handlers.add(func)
         if when_not_ready:
             self.base_gcode_handlers[cmd] = func
         if desc is not None:
             self.gcode_help[cmd] = desc
         self._build_status_commands()
-    def register_mux_command(self, cmd, key, value, func, desc=None):
+    def register_mux_command(self, cmd, key, value, func, desc=None,
+                             during_temperature_wait=False):
         prev = self.mux_commands.get(cmd)
         if prev is None:
             handler = lambda gcmd: self._cmd_mux(cmd, gcmd)
-            self.register_command(cmd, handler, desc=desc)
+            self.register_command(
+                cmd, handler, desc=desc,
+                during_temperature_wait=during_temperature_wait)
             self.mux_commands[cmd] = prev = (key, {})
         prev_key, prev_values = prev
         if prev_key != key:
@@ -184,6 +201,7 @@ class GCodeDispatch:
     def register_output_handler(self, cb):
         self.output_callbacks.append(cb)
     def _handle_shutdown(self):
+        self._wake_temperature_wait()
         if not self.is_printer_ready:
             return
         self.is_printer_ready = False
@@ -191,6 +209,7 @@ class GCodeDispatch:
         self._build_status_commands()
         self._respond_state("Shutdown")
     def _handle_disconnect(self):
+        self._wake_temperature_wait()
         self._respond_state("Disconnect")
     def _handle_ready(self):
         self.is_printer_ready = True
@@ -199,6 +218,86 @@ class GCodeDispatch:
         self._respond_state("Ready")
     # Parse input into commands
     args_r = re.compile('([A-Z_]+|[A-Z*])')
+    def _get_command_from_line(self, line):
+        line = line.strip()
+        cpos = line.find(';')
+        if cpos >= 0:
+            line = line[:cpos]
+        parts = self.args_r.split(line.upper())
+        if ''.join(parts[:2]) == 'N':
+            return ''.join(parts[3:5]).strip()
+        return ''.join(parts[:3]).strip()
+    def _get_temperature_wait_script_type(self, script):
+        commands = [self._get_command_from_line(line)
+                    for line in script.split('\n')]
+        commands = [command for command in commands if command]
+        is_control = all(
+            (command in self.TEMPERATURE_WAIT_NAMED_CONTROLS
+             or self.gcode_handlers.get(command)
+             in self.temperature_wait_safe_handlers)
+            for command in commands)
+        return is_control, 'CANCEL_PRINT' in commands
+    def _wake_temperature_wait(self):
+        wait = self.active_temperature_wait
+        if wait is None:
+            return
+        wake = wait.get('wake')
+        if wake is not None:
+            wake.complete(None)
+    def notify_temperature_wait(self):
+        self._wake_temperature_wait()
+    def wait_for_temperature(self, check_ready, check_interval):
+        if self.active_temperature_wait is not None:
+            raise self.error("A temperature wait is already active")
+        if not self.mutex.is_owned_by_current():
+            raise self.error(
+                "Temperature wait requested outside G-Code dispatch")
+        wait = {
+            'cancelled': False,
+            'finished': self.reactor.completion(),
+            'wake': None,
+        }
+        completed_normally = False
+        mutex_owned = True
+        self.active_temperature_wait = wait
+        self.mutex.unlock()
+        mutex_owned = False
+        try:
+            while 1:
+                while (not wait['cancelled']
+                       and not self.printer.is_shutdown()):
+                    eventtime = self.reactor.monotonic()
+                    if check_ready(eventtime):
+                        break
+                    wake = wait['wake'] = self.reactor.completion()
+                    wake.wait(eventtime + check_interval)
+                    wait['wake'] = None
+                # A target setter may have run ahead of this owner in the
+                # mutex queue.  Recheck the live target after reacquiring.
+                self.mutex.lock()
+                mutex_owned = True
+                if (wait['cancelled'] or self.printer.is_shutdown()):
+                    break
+                if check_ready(self.reactor.monotonic()):
+                    completed_normally = True
+                    break
+                self.mutex.unlock()
+                mutex_owned = False
+        finally:
+            wait['wake'] = None
+            # Keep the control gate active until this original G-Code owner
+            # has reacquired the mutex.  This preserves macro/script order.
+            if not mutex_owned:
+                self.mutex.lock()
+            finished_normally = (completed_normally
+                                 and not wait['cancelled']
+                                 and not self.printer.is_shutdown())
+            if self.active_temperature_wait is wait:
+                self.active_temperature_wait = None
+            result = None if finished_normally else self.SCRIPT_CANCELLED
+            wait['finished'].complete(result)
+        if not finished_normally:
+            raise TemperatureWaitCancelled()
     def _process_commands(self, commands, need_ack=True):
         for line in commands:
             # Ignore comments and leading/trailing spaces
@@ -221,6 +320,10 @@ class GCodeDispatch:
             handler = self.gcode_handlers.get(cmd, self.cmd_default)
             try:
                 handler(gcmd)
+            except TemperatureWaitCancelled:
+                if need_ack:
+                    return
+                raise
             except self.error as e:
                 self._respond_error(str(e))
                 self.printer.send_event("gcode:command_error")
@@ -237,8 +340,36 @@ class GCodeDispatch:
     def run_script_from_command(self, script):
         self._process_commands(script.split('\n'), need_ack=False)
     def run_script(self, script):
-        with self.mutex:
-            self._process_commands(script.split('\n'), need_ack=False)
+        is_control, is_cancel = self._get_temperature_wait_script_type(script)
+        while 1:
+            wait = self.active_temperature_wait
+            if wait is not None and is_cancel:
+                wait['cancelled'] = True
+                self._wake_temperature_wait()
+            if wait is not None and not is_control:
+                result = wait['finished'].wait()
+                if result is self.SCRIPT_CANCELLED:
+                    return self.SCRIPT_CANCELLED
+                continue
+            retry = False
+            with self.mutex:
+                wait = self.active_temperature_wait
+                if wait is not None and not is_control:
+                    retry = True
+                else:
+                    if wait is not None and is_cancel:
+                        wait['cancelled'] = True
+                        self._wake_temperature_wait()
+                    try:
+                        self._process_commands(
+                            script.split('\n'), need_ack=False)
+                    except TemperatureWaitCancelled:
+                        return self.SCRIPT_CANCELLED
+                    finally:
+                        if wait is not None and is_control:
+                            self._wake_temperature_wait()
+            if not retry:
+                return None
     def get_mutex(self):
         return self.mutex
     def create_gcode_command(self, command, commandline, params):

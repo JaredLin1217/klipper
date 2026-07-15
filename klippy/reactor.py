@@ -68,15 +68,19 @@ class ReactorMutex:
     def __init__(self, reactor, is_locked):
         self.reactor = reactor
         self.is_locked = is_locked
+        self.owner = greenlet.getcurrent() if is_locked else None
         self.next_pending = False
         self.queue = []
         self.lock = self.__enter__
         self.unlock = self.__exit__
     def test(self):
         return self.is_locked
+    def is_owned_by_current(self):
+        return self.owner is greenlet.getcurrent()
     def __enter__(self):
         if not self.is_locked:
             self.is_locked = True
+            self.owner = greenlet.getcurrent()
             return
         g = greenlet.getcurrent()
         self.queue.append(g)
@@ -85,8 +89,10 @@ class ReactorMutex:
             if self.next_pending and self.queue[0] is g:
                 self.next_pending = False
                 self.queue.pop(0)
+                self.owner = g
                 return
     def __exit__(self, type=None, value=None, tb=None):
+        self.owner = None
         if not self.queue:
             self.is_locked = False
             return
