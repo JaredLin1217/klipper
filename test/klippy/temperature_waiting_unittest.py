@@ -80,6 +80,7 @@ class FakeDispatchPrinter:
         self.events = []
         self.shutdown = False
         self.shutdown_messages = []
+        self.objects = {}
 
     def get_reactor(self):
         return self.reactor
@@ -103,9 +104,31 @@ class FakeDispatchPrinter:
     def is_shutdown(self):
         return self.shutdown
 
+    def lookup_object(self, name, default=None):
+        return self.objects.get(name, default)
+
 
 class NamedStringIO(io.StringIO):
     name = "temperature_waiting.gcode"
+
+
+class FakeLiveHeater(heaters.Heater):
+    def __init__(self, temperature, tolerance=3., name='extruder'):
+        self.temperature = temperature
+        self.tolerance = tolerance
+        self.name = name
+
+    def get_temp(self, eventtime):
+        return (self.temperature['actual'], self.temperature['target'])
+
+    def get_temperature_wait_tolerance(self):
+        return self.tolerance
+
+    def get_name(self):
+        return self.name
+
+    def set_temp(self, target):
+        self.temperature['target'] = target
 
 
 class UniversalWaitHarness(unittest.TestCase):
@@ -116,6 +139,8 @@ class UniversalWaitHarness(unittest.TestCase):
         self.gcode._handle_ready()
         self.trace = []
         self.temperature = {'actual': 20., 'target': 100.}
+        self.heater = FakeLiveHeater(self.temperature)
+        self.other_heater_target = 60.
         self.virtual_sd = None
         self.mid_wait = None
 
@@ -152,25 +177,19 @@ class UniversalWaitHarness(unittest.TestCase):
         self.temperature['target'] = 0.
         self.trace.append('turn_off_heaters')
 
-    def _temperature_ready(self, eventtime):
-        return (self.temperature['target'] <= 0.
-                or self.temperature['actual']
-                >= self.temperature['target'])
-
-    def _temperature_target(self, eventtime):
-        return self.temperature['target']
-
     def cmd_M109(self, gcmd):
         target = gcmd.get_float('S', self.temperature['target'])
         self.temperature['target'] = target
         self.trace.append(('wait', target))
+        target_wait = heaters.HeaterTargetWait(
+            self.heater, self.gcode.cancel_temperature_wait)
         if self.virtual_sd is not None:
             self.virtual_sd.begin_temperature_wait(
-                'extruder', self._temperature_ready,
-                self._temperature_target)
+                'extruder', target_wait.check_ready,
+                target_wait.get_target)
         else:
             self.gcode.wait_for_temperature(
-                self._temperature_ready, .25)
+                target_wait.check_ready, .25)
 
     def cmd_INNER_WAIT(self, gcmd):
         self.gcode.run_script_from_command(
@@ -186,6 +205,7 @@ class UniversalWaitHarness(unittest.TestCase):
 
     def cmd_CANCEL_BASE(self, gcmd):
         self.trace.append('cancel_base')
+        self.other_heater_target = 0.
         if self.virtual_sd is not None:
             self.virtual_sd.do_cancel()
 
@@ -235,6 +255,7 @@ class UniversalWaitHarness(unittest.TestCase):
         vsd.gcode = self.gcode
         vsd.printer = self.printer
         self.virtual_sd = vsd
+        self.printer.objects['virtual_sdcard'] = vsd
         return vsd, stats
 
 
@@ -345,16 +366,55 @@ class UniversalTemperatureWaitingTest(UniversalWaitHarness):
         self.assertNotIn('owner_after', snapshots[0])
         self.assertIn('owner_after', self.trace)
 
+    def test_live_target_lower_waits_for_cooling_tolerance(self):
+        self.temperature['actual'] = 150.
+        snapshots = []
+
+        def start(eventtime):
+            self.gcode.run_script(
+                "M109 S200\nMARK NAME=owner_after")
+
+        self.schedule(0., start)
+        self.schedule(.1, lambda eventtime: self.set_target(100.))
+        self.schedule(.2, lambda eventtime:
+                      snapshots.append(list(self.trace)))
+        self.schedule(.3, lambda eventtime:
+                      self.set_target(100., actual=103.))
+        self.run_until()
+
+        self.assertNotIn('owner_after', snapshots[0])
+        self.assertIn('owner_after', self.trace)
+
+    def test_cooling_completion_uses_periodic_sensor_check(self):
+        self.temperature['actual'] = 150.
+        return_time = []
+
+        def start(eventtime):
+            self.gcode.run_script(
+                "M109 S100\nMARK NAME=owner_after")
+            return_time.append(self.reactor.monotonic())
+
+        self.schedule(0., start)
+        # A sensor update does not issue G-Code or explicitly wake the wait.
+        self.schedule(.1, lambda eventtime:
+                      self.temperature.__setitem__('actual', 90.))
+        self.run_until()
+
+        self.assertIn('owner_after', self.trace)
+        self.assertEqual([.25], return_time)
+
     def test_rechecks_target_after_mutex_queue_setter(self):
         self.temperature['actual'] = 100.
         snapshots = []
 
         def racy_wait(gcmd):
             self.temperature['target'] = 100.
+            target_wait = heaters.HeaterTargetWait(
+                self.heater, self.gcode.cancel_temperature_wait)
             # Keep the mutex while the higher-target setter enters its queue.
             self.reactor.pause(.1)
             self.gcode.wait_for_temperature(
-                self._temperature_ready, .25)
+                target_wait.check_ready, .25)
 
         self.gcode.register_command('RACY_WAIT', racy_wait)
 
@@ -373,22 +433,50 @@ class UniversalTemperatureWaitingTest(UniversalWaitHarness):
         self.assertNotIn('owner_after', snapshots[0])
         self.assertIn('owner_after', self.trace)
 
-    def test_turn_off_heaters_immediately_releases_wait(self):
-        return_time = []
+    def test_rechecks_lower_target_after_mutex_queue_setter(self):
+        self.temperature['actual'] = 100.
+        snapshots = []
+
+        def racy_wait(gcmd):
+            self.temperature['target'] = 100.
+            target_wait = heaters.HeaterTargetWait(
+                self.heater, self.gcode.cancel_temperature_wait)
+            self.reactor.pause(.1)
+            self.gcode.wait_for_temperature(
+                target_wait.check_ready, .25)
+
+        self.gcode.register_command('RACY_COOL_WAIT', racy_wait)
 
         def start(eventtime):
             self.gcode.run_script(
-                "M109 S100\nMARK NAME=owner_after")
-            return_time.append(self.reactor.monotonic())
+                "RACY_COOL_WAIT\nMARK NAME=owner_after")
+
+        self.schedule(0., start)
+        self.schedule(.05, lambda eventtime: self.set_target(80.))
+        self.schedule(.2, lambda eventtime:
+                      snapshots.append(list(self.trace)))
+        self.schedule(.3, lambda eventtime:
+                      self.set_target(80., actual=83.))
+        self.run_until()
+
+        self.assertNotIn('owner_after', snapshots[0])
+        self.assertIn('owner_after', self.trace)
+
+    def test_turn_off_heaters_cancels_waiting_script(self):
+        owner_result = []
+
+        def start(eventtime):
+            owner_result.append(self.gcode.run_script(
+                "M109 S100\nMARK NAME=owner_after"))
 
         self.schedule(0., start)
         self.schedule(.1, lambda eventtime:
                       self.gcode.run_script("TURN_OFF_HEATERS"))
         self.run_until()
 
-        self.assertLess(self.trace.index('turn_off_heaters'),
-                        self.trace.index('owner_after'))
-        self.assertEqual([.1], return_time)
+        self.assertIn('turn_off_heaters', self.trace)
+        self.assertNotIn('owner_after', self.trace)
+        self.assertEqual([self.gcode.SCRIPT_CANCELLED], owner_result)
 
     def test_wait_error_discards_queued_unsafe_command(self):
         owner_errors = []
@@ -635,6 +723,95 @@ class UniversalTemperatureWaitingTest(UniversalWaitHarness):
         self.assertNotIn('file_after', self.trace)
         self.assertFalse(self.printer.shutdown)
 
+    def test_virtual_sd_zero_target_runs_cancel_cleanup(self):
+        vsd, stats = self.build_virtual_sd(
+            "M109 S100\nMARK NAME=file_after\n")
+
+        vsd.work_timer = self.reactor.register_timer(vsd.work_handler, 0.)
+        self.schedule(.1, lambda eventtime: self.set_target(0.))
+        self.run_until()
+
+        self.assertEqual('cancelled', stats.state)
+        self.assertIsNone(vsd.current_file)
+        self.assertIsNone(vsd.temperature_wait)
+        self.assertEqual(0, vsd.file_position)
+        self.assertEqual(0, vsd.file_size)
+        self.assertIn('cancel_before', self.trace)
+        self.assertIn('cancel_base', self.trace)
+        self.assertIn('cancel_after', self.trace)
+        self.assertEqual(0., self.other_heater_target)
+        self.assertNotIn('file_after', self.trace)
+        self.assertFalse(self.printer.shutdown)
+
+    def test_zero_target_and_user_cancel_share_one_transaction(self):
+        vsd, stats = self.build_virtual_sd(
+            "M109 S100\nMARK NAME=file_after\n")
+        self.gcode.register_command('CANCEL_PRINT', None)
+        duplicate_results = []
+
+        def slow_cancel(gcmd):
+            self.trace.append('slow_cancel_begin')
+            self.virtual_sd.do_cancel()
+            self.reactor.pause(self.reactor.monotonic() + .2)
+            self.trace.append('slow_cancel_end')
+
+        self.gcode.register_command('CANCEL_PRINT', slow_cancel)
+
+        vsd.work_timer = self.reactor.register_timer(vsd.work_handler, 0.)
+        self.schedule(.1, lambda eventtime: self.set_target(0.))
+        self.schedule(.15, lambda eventtime:
+                      duplicate_results.append(
+                          self.gcode.run_script("CANCEL_PRINT")))
+        self.run_until()
+
+        self.assertEqual(1, self.trace.count('slow_cancel_begin'))
+        self.assertEqual(1, self.trace.count('slow_cancel_end'))
+        self.assertEqual([self.gcode.SCRIPT_CANCELLED], duplicate_results)
+        self.assertEqual('cancelled', stats.state)
+        self.assertNotIn('file_after', self.trace)
+        self.assertIsNone(self.gcode.active_cancel_transaction)
+        self.assertFalse(self.printer.shutdown)
+
+    def test_cancel_token_survives_control_queue_before_owner_unwind(self):
+        vsd, stats = self.build_virtual_sd(
+            "M109 S100\nMARK NAME=file_after\n")
+        self.gcode.register_command('CANCEL_PRINT', None)
+        duplicate_results = []
+
+        def slow_cancel(gcmd):
+            self.trace.append('slow_cancel_begin')
+            self.virtual_sd.do_cancel()
+            self.reactor.pause(self.reactor.monotonic() + .2)
+            self.trace.append('slow_cancel_end')
+
+        def slow_control(gcmd):
+            self.trace.append('slow_control_begin')
+            self.reactor.pause(self.reactor.monotonic() + .2)
+            self.trace.append('slow_control_end')
+
+        self.gcode.register_command('CANCEL_PRINT', slow_cancel)
+        self.gcode.register_command(
+            'SLOW_CONTROL', slow_control, during_temperature_wait=True)
+
+        vsd.work_timer = self.reactor.register_timer(vsd.work_handler, 0.)
+        self.schedule(.1, lambda eventtime: self.set_target(0.))
+        self.schedule(.15, lambda eventtime:
+                      self.gcode.run_script("SLOW_CONTROL"))
+        self.schedule(.35, lambda eventtime:
+                      duplicate_results.append(
+                          self.gcode.run_script("CANCEL_PRINT")))
+        self.run_until()
+
+        self.assertEqual(1, self.trace.count('slow_cancel_begin'))
+        self.assertEqual(1, self.trace.count('slow_cancel_end'))
+        self.assertEqual(1, self.trace.count('slow_control_begin'))
+        self.assertEqual(1, self.trace.count('slow_control_end'))
+        self.assertEqual([self.gcode.SCRIPT_CANCELLED], duplicate_results)
+        self.assertEqual('cancelled', stats.state)
+        self.assertNotIn('file_after', self.trace)
+        self.assertIsNone(self.gcode.active_cancel_transaction)
+        self.assertFalse(self.printer.shutdown)
+
     def test_feature_disabled_does_not_register_wait(self):
         vsd, stats = self.build_virtual_sd("")
         vsd.cancelable_temperature_wait = False
@@ -650,6 +827,10 @@ class FakeWaitGCode:
 
     def __init__(self, **params):
         self.params = params
+        self.responses = []
+
+    def respond_raw(self, message):
+        self.responses.append(message)
 
     def get(self, name, default=None):
         return self.params.get(name, default)
@@ -679,6 +860,76 @@ class FakeVirtualSDWaitReceiver:
         return True
 
 
+class FakeTemperatureWaitDispatch:
+    def __init__(self):
+        self.cancel_count = 0
+        self.notify_count = 0
+        self.responses = []
+
+    def notify_temperature_wait(self):
+        self.notify_count += 1
+
+    def respond_raw(self, message):
+        self.responses.append(message)
+
+    def cancel_temperature_wait(self):
+        self.cancel_count += 1
+        raise gcode.TemperatureWaitCancelled()
+
+
+class FakeDisabledVirtualSD:
+    def begin_temperature_wait(self, sensor, check_ready, get_target):
+        return False
+
+
+class FakeFallbackReactor:
+    def __init__(self, on_pause=None):
+        self.now = 0.
+        self.pause_count = 0
+        self.on_pause = on_pause
+
+    def monotonic(self):
+        return self.now
+
+    def pause(self, waketime):
+        self.now = waketime
+        self.pause_count += 1
+        if self.on_pause is not None:
+            self.on_pause(self.pause_count)
+        return self.now
+
+
+class FakeFallbackToolhead:
+    def __init__(self):
+        self.flush_count = 0
+
+    def get_last_move_time(self):
+        self.flush_count += 1
+        return 0.
+
+
+class FakeFallbackPrinter:
+    def __init__(self, reactor, dispatch, virtual_sd, toolhead):
+        self.reactor = reactor
+        self.objects = {
+            'gcode': dispatch,
+            'virtual_sdcard': virtual_sd,
+            'toolhead': toolhead,
+        }
+
+    def get_start_args(self):
+        return {}
+
+    def get_reactor(self):
+        return self.reactor
+
+    def is_shutdown(self):
+        return False
+
+    def lookup_object(self, name, default=None):
+        return self.objects.get(name, default)
+
+
 class FakeHeaterPrinter:
     def __init__(self, virtual_sd, objects):
         self.virtual_sd = virtual_sd
@@ -699,27 +950,153 @@ class FakeHeaterPrinter:
 
 
 class HeaterTemperatureWaitingTest(unittest.TestCase):
-    def test_follow_target_registers_dynamic_heater_wait(self):
-        temperature = {'actual': 20., 'target': 100.}
+    def build_fallback_wait(self, actual, target, tolerance=3.,
+                            on_pause=None):
+        temperature = {'actual': actual, 'target': target}
+        heater = FakeLiveHeater(temperature, tolerance)
+        reactor = FakeFallbackReactor(on_pause)
+        dispatch = FakeTemperatureWaitDispatch()
+        virtual_sd = FakeDisabledVirtualSD()
+        toolhead = FakeFallbackToolhead()
+        printer = FakeFallbackPrinter(
+            reactor, dispatch, virtual_sd, toolhead)
+        pheaters = heaters.PrinterHeaters.__new__(heaters.PrinterHeaters)
+        pheaters.printer = printer
+        pheaters.heaters = {'extruder': heater}
+        pheaters._get_temp = lambda eventtime: "T:%.1f" % (
+            temperature['actual'],)
+        return (temperature, heater, reactor, dispatch, toolhead, pheaters)
+
+    def build_follow_target_wait(self, actual=20., target=100., tolerance=3.):
+        temperature = {'actual': actual, 'target': target}
         heater = heaters.Heater.__new__(heaters.Heater)
+        heater.temperature_wait_tolerance = tolerance
         heater.get_temp = lambda eventtime: (temperature['actual'],
                                              temperature['target'])
+        heater.set_temp = lambda value: temperature.__setitem__(
+            'target', value)
         receiver = FakeVirtualSDWaitReceiver()
-        printer = FakeHeaterPrinter(receiver, {})
+        dispatch = FakeTemperatureWaitDispatch()
+        printer = FakeHeaterPrinter(
+            receiver, {'gcode': dispatch})
         pheaters = heaters.PrinterHeaters.__new__(heaters.PrinterHeaters)
         pheaters.printer = printer
         pheaters.heaters = {'extruder': heater}
 
         pheaters.cmd_TEMPERATURE_WAIT(FakeWaitGCode(
             SENSOR='extruder', FOLLOW_TARGET=1))
-
         sensor, check_ready, get_target = receiver.wait
+        return (temperature, dispatch, sensor, check_ready, get_target)
+
+    def test_follow_target_registers_dynamic_heater_wait(self):
+        temperature, dispatch, sensor, check_ready, get_target = \
+            self.build_follow_target_wait()
         self.assertEqual('extruder', sensor)
         self.assertFalse(check_ready(0.))
         temperature['target'] = 50.
         self.assertEqual(50., get_target(0.))
-        temperature['actual'] = 50.
+        temperature['actual'] = 46.99
+        self.assertFalse(check_ready(0.))
+        temperature['actual'] = 47.
         self.assertTrue(check_ready(0.))
+
+    def test_follow_target_waits_in_cooling_direction(self):
+        temperature, dispatch, sensor, check_ready, get_target = \
+            self.build_follow_target_wait(actual=150., target=100.)
+
+        self.assertFalse(check_ready(0.))
+        temperature['actual'] = 103.01
+        self.assertFalse(check_ready(0.))
+        temperature['actual'] = 103.
+        self.assertTrue(check_ready(0.))
+
+        # Crossing the whole tolerance band between polls still counts as
+        # reaching the target in the selected cooling direction.
+        temperature, dispatch, sensor, check_ready, get_target = \
+            self.build_follow_target_wait(actual=150., target=100.)
+        self.assertFalse(check_ready(0.))
+        temperature['actual'] = 90.
+        self.assertTrue(check_ready(0.))
+
+    def test_follow_target_reselects_direction_on_each_target_change(self):
+        temperature, dispatch, sensor, check_ready, get_target = \
+            self.build_follow_target_wait(actual=20., target=100.)
+
+        self.assertFalse(check_ready(0.))
+        temperature.update(actual=110., target=80.)
+        self.assertFalse(check_ready(0.))
+        temperature.update(actual=100., target=120.)
+        self.assertFalse(check_ready(0.))
+        temperature['actual'] = 117.
+        self.assertTrue(check_ready(0.))
+        temperature.update(actual=120., target=110.)
+        self.assertFalse(check_ready(0.))
+        temperature['actual'] = 113.
+        self.assertTrue(check_ready(0.))
+
+    def test_follow_target_rechecks_drift_after_ready_sample(self):
+        temperature, dispatch, sensor, check_ready, get_target = \
+            self.build_follow_target_wait(actual=100., target=100.)
+
+        self.assertTrue(check_ready(0.))
+        temperature['actual'] = 110.
+        self.assertFalse(check_ready(0.))
+        temperature['actual'] = 103.
+        self.assertTrue(check_ready(0.))
+
+    def test_follow_target_uses_each_heater_tolerance(self):
+        temperature, dispatch, sensor, check_ready, get_target = \
+            self.build_follow_target_wait(
+                actual=94.99, target=100., tolerance=5.)
+
+        self.assertFalse(check_ready(0.))
+        temperature['actual'] = 95.
+        self.assertTrue(check_ready(0.))
+
+    def test_zero_target_cancels_wait_instead_of_continuing(self):
+        temperature, dispatch, sensor, check_ready, get_target = \
+            self.build_follow_target_wait()
+        temperature['target'] = 0.
+
+        with self.assertRaises(gcode.TemperatureWaitCancelled):
+            check_ready(0.)
+        self.assertEqual(1, dispatch.cancel_count)
+        self.assertEqual(1, dispatch.notify_count)
+
+    def test_native_temperature_wait_fallback_uses_cooling_tolerance(self):
+        state = {}
+
+        def on_pause(count):
+            state['temperature']['actual'] = 90.
+
+        result = self.build_fallback_wait(
+            actual=150., target=100., on_pause=on_pause)
+        temperature, heater, reactor, dispatch, toolhead, pheaters = result
+        state['temperature'] = temperature
+
+        pheaters._wait_for_temperature(heater)
+
+        self.assertEqual(1, reactor.pause_count)
+        self.assertEqual(90., temperature['actual'])
+        self.assertEqual(1, len(dispatch.responses))
+
+    def test_follow_target_fallback_uses_heating_tolerance(self):
+        state = {}
+
+        def on_pause(count):
+            state['temperature']['actual'] = 97.
+
+        result = self.build_fallback_wait(
+            actual=20., target=100., on_pause=on_pause)
+        temperature, heater, reactor, dispatch, toolhead, pheaters = result
+        state['temperature'] = temperature
+        gcmd = FakeWaitGCode(SENSOR='extruder', FOLLOW_TARGET=1)
+
+        pheaters.cmd_TEMPERATURE_WAIT(gcmd)
+
+        self.assertEqual(1, reactor.pause_count)
+        self.assertEqual(97., temperature['actual'])
+        self.assertEqual(1, len(gcmd.responses))
 
     def test_follow_target_rejects_non_heater_sensor(self):
         class FakeSensor:

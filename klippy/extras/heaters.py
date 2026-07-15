@@ -18,6 +18,43 @@ MAX_MAINTHREAD_TIME = 5.0
 QUELL_STALE_TIME = 7.0
 MIN_PWM_CHANGE_RATIO = 0.05
 
+class HeaterTargetWait:
+    """Track a live heater target and the direction needed to reach it."""
+    HEATING = 1
+    COOLING = -1
+    WITHIN_TOLERANCE = 0
+    def __init__(self, heater, cancel_wait):
+        self.heater = heater
+        self.cancel_wait = cancel_wait
+        self.tolerance = heater.get_temperature_wait_tolerance()
+        self.target = None
+        self.direction = self.WITHIN_TOLERANCE
+    def _update_direction(self, temp, target):
+        if temp < target - self.tolerance:
+            self.direction = self.HEATING
+        elif temp > target + self.tolerance:
+            self.direction = self.COOLING
+        else:
+            self.direction = self.WITHIN_TOLERANCE
+        self.target = target
+    def check_ready(self, eventtime):
+        temp, target = self.heater.get_temp(eventtime)
+        if target <= 0.:
+            # Zero is not a reachable temperature target.  Clearing a target
+            # while waiting must not let the remainder of a print continue.
+            self.cancel_wait()
+            return False
+        if (target != self.target
+            or self.direction == self.WITHIN_TOLERANCE):
+            self._update_direction(temp, target)
+        if self.direction == self.HEATING:
+            return temp >= target - self.tolerance
+        if self.direction == self.COOLING:
+            return temp <= target + self.tolerance
+        return True
+    def get_target(self, eventtime):
+        return self.heater.get_temp(eventtime)[1]
+
 class Heater:
     def __init__(self, config, sensor):
         self.printer = config.get_printer()
@@ -40,6 +77,8 @@ class Heater:
         self.max_power = config.getfloat('max_power', 1., above=0., maxval=1.)
         self.min_pwm_change = self.max_power * MIN_PWM_CHANGE_RATIO
         self.smooth_time = config.getfloat('smooth_time', 1., above=0.)
+        self.temperature_wait_tolerance = config.getfloat(
+            'temperature_wait_tolerance', 3., above=0.)
         self.inv_smooth_time = 1. / self.smooth_time
         self.verify_mainthread_time = -999.
         self.lock = threading.Lock()
@@ -107,6 +146,8 @@ class Heater:
         return self.max_power
     def get_smooth_time(self):
         return self.smooth_time
+    def get_temperature_wait_tolerance(self):
+        return self.temperature_wait_tolerance
     def set_temp(self, degrees):
         if degrees and (degrees < self.min_temp or degrees > self.max_temp):
             raise self.printer.command_error(
@@ -152,7 +193,9 @@ class Heater:
             smoothed_temp = self.smoothed_temp
             last_pwm_value = self.last_pwm_value
         return {'temperature': round(smoothed_temp, 2), 'target': target_temp,
-                'power': last_pwm_value}
+                'power': last_pwm_value,
+                'temperature_wait_tolerance':
+                    self.temperature_wait_tolerance}
     cmd_SET_HEATER_TEMPERATURE_help = "Sets a heater temperature"
     def cmd_SET_HEATER_TEMPERATURE(self, gcmd):
         temp = gcmd.get_float('TARGET', 0.)
@@ -358,22 +401,31 @@ class PrinterHeaters:
             return False
         return virtual_sd.begin_temperature_wait(
             sensor_name, check_ready, get_target)
+    def _new_heater_target_wait(self, heater):
+        gcode = self.printer.lookup_object("gcode")
+        def cancel_wait():
+            # A zero target means the user stopped the wait.  Shut down every
+            # heater before running the configured CANCEL_PRINT transaction.
+            self.turn_off_all_heaters()
+            gcode.cancel_temperature_wait()
+        return HeaterTargetWait(heater, cancel_wait)
     def _wait_for_temperature(self, heater):
-        # Helper to wait on heater.check_busy() and report M105 temperatures
+        # Helper to wait on the heater's live target and report temperatures.
         if self.printer.get_start_args().get('debugoutput') is not None:
             return
         toolhead = self.printer.lookup_object("toolhead")
         toolhead.get_last_move_time()
+        target_wait = self._new_heater_target_wait(heater)
         if self._start_responsive_temperature_wait(
                 heater.get_name(),
-                lambda eventtime: (heater.get_temp(eventtime)[1] <= 0.
-                                   or not heater.check_busy(eventtime)),
-                lambda eventtime: heater.get_temp(eventtime)[1]):
+                target_wait.check_ready, target_wait.get_target):
             return
         gcode = self.printer.lookup_object("gcode")
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
-        while not self.printer.is_shutdown() and heater.check_busy(eventtime):
+        while not self.printer.is_shutdown():
+            if target_wait.check_ready(eventtime):
+                return
             print_time = toolhead.get_last_move_time()
             gcode.respond_raw(self._get_temp(eventtime))
             eventtime = reactor.pause(eventtime + 1.)
@@ -412,11 +464,9 @@ class PrinterHeaters:
                 "heater sensor.")
 
         if follow_target:
-            def check_ready(eventtime):
-                temp, target = sensor.get_temp(eventtime)
-                return target <= 0. or temp >= target
-            def get_target(eventtime):
-                return sensor.get_temp(eventtime)[1]
+            target_wait = self._new_heater_target_wait(sensor)
+            check_ready = target_wait.check_ready
+            get_target = target_wait.get_target
         else:
             def check_ready(eventtime):
                 temp, target = sensor.get_temp(eventtime)

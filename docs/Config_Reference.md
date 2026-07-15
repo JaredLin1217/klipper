@@ -994,6 +994,12 @@ sensor_pin:
 #   A time value (in seconds) over which temperature measurements will
 #   be smoothed to reduce the impact of measurement noise. The default
 #   is 1 seconds.
+#temperature_wait_tolerance: 3.0
+#   Temperature tolerance in Celsius used by M109, M190, and
+#   TEMPERATURE_WAIT FOLLOW_TARGET=1. A heating wait completes at
+#   target minus this value; a cooling wait completes at target plus
+#   this value. The direction is recalculated whenever the live target
+#   changes. The default is 3 degrees Celsius.
 control:
 #   Control algorithm (either pid or watermark). This parameter must
 #   be provided.

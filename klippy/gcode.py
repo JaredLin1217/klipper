@@ -116,6 +116,7 @@ class GCodeDispatch:
         self.is_printer_ready = False
         self.mutex = self.reactor.mutex()
         self.active_temperature_wait = None
+        self.active_cancel_transaction = None
         self.temperature_wait_safe_handlers = set()
         self.output_callbacks = []
         self.base_gcode_handlers = self.gcode_handlers = {}
@@ -246,6 +247,48 @@ class GCodeDispatch:
             wake.complete(None)
     def notify_temperature_wait(self):
         self._wake_temperature_wait()
+    def _begin_cancel_transaction(self):
+        if self.active_cancel_transaction is not None:
+            return None
+        token = self.active_cancel_transaction = object()
+        return token
+    def _finish_cancel_transaction(self, token):
+        if self.active_cancel_transaction is token:
+            self.active_cancel_transaction = None
+    def _finish_or_defer_cancel_transaction(self, token, wait):
+        if wait is not None and not wait['finished'].test():
+            wait['cancel_token'] = token
+            return
+        self._finish_cancel_transaction(token)
+    def cancel_temperature_wait(self):
+        """Run print cancellation and abort a cleared-target wait owner."""
+        wait = self.active_temperature_wait
+        if wait is not None:
+            wait['cancelled'] = True
+            self._wake_temperature_wait()
+        virtual_sd = self.printer.lookup_object('virtual_sdcard', None)
+        is_sd_print = virtual_sd is not None and virtual_sd.is_active()
+        if is_sd_print and 'CANCEL_PRINT' in self.gcode_handlers:
+            token = self._begin_cancel_transaction()
+            if token is not None:
+                try:
+                    try:
+                        if self.mutex.is_owned_by_current():
+                            self._process_commands(
+                                ['CANCEL_PRINT'], need_ack=False)
+                        else:
+                            with self.mutex:
+                                self._process_commands(
+                                    ['CANCEL_PRINT'], need_ack=False)
+                    except TemperatureWaitCancelled:
+                        pass
+                    except self.error:
+                        logging.exception(
+                            "CANCEL_PRINT failed while clearing "
+                            "temperature wait")
+                finally:
+                    self._finish_or_defer_cancel_transaction(token, wait)
+        raise TemperatureWaitCancelled()
     def wait_for_temperature(self, check_ready, check_interval):
         if self.active_temperature_wait is not None:
             raise self.error("A temperature wait is already active")
@@ -254,6 +297,7 @@ class GCodeDispatch:
                 "Temperature wait requested outside G-Code dispatch")
         wait = {
             'cancelled': False,
+            'cancel_token': None,
             'finished': self.reactor.completion(),
             'wake': None,
         }
@@ -296,6 +340,9 @@ class GCodeDispatch:
                 self.active_temperature_wait = None
             result = None if finished_normally else self.SCRIPT_CANCELLED
             wait['finished'].complete(result)
+            cancel_token = wait['cancel_token']
+            if cancel_token is not None:
+                self._finish_cancel_transaction(cancel_token)
         if not finished_normally:
             raise TemperatureWaitCancelled()
     def _process_commands(self, commands, need_ack=True):
@@ -341,35 +388,48 @@ class GCodeDispatch:
         self._process_commands(script.split('\n'), need_ack=False)
     def run_script(self, script):
         is_control, is_cancel = self._get_temperature_wait_script_type(script)
-        while 1:
-            wait = self.active_temperature_wait
-            if wait is not None and is_cancel:
-                wait['cancelled'] = True
-                self._wake_temperature_wait()
-            if wait is not None and not is_control:
-                result = wait['finished'].wait()
-                if result is self.SCRIPT_CANCELLED:
-                    return self.SCRIPT_CANCELLED
-                continue
-            retry = False
-            with self.mutex:
+        cancel_token = None
+        cancel_wait = None
+        if is_cancel:
+            cancel_token = self._begin_cancel_transaction()
+            if cancel_token is None:
+                return self.SCRIPT_CANCELLED
+        try:
+            while 1:
                 wait = self.active_temperature_wait
+                if wait is not None and is_cancel:
+                    if cancel_wait is None:
+                        cancel_wait = wait
+                    wait['cancelled'] = True
+                    self._wake_temperature_wait()
                 if wait is not None and not is_control:
-                    retry = True
-                else:
-                    if wait is not None and is_cancel:
-                        wait['cancelled'] = True
-                        self._wake_temperature_wait()
-                    try:
-                        self._process_commands(
-                            script.split('\n'), need_ack=False)
-                    except TemperatureWaitCancelled:
+                    result = wait['finished'].wait()
+                    if result is self.SCRIPT_CANCELLED:
                         return self.SCRIPT_CANCELLED
-                    finally:
-                        if wait is not None and is_control:
+                    continue
+                retry = False
+                with self.mutex:
+                    wait = self.active_temperature_wait
+                    if wait is not None and not is_control:
+                        retry = True
+                    else:
+                        if wait is not None and is_cancel:
+                            wait['cancelled'] = True
                             self._wake_temperature_wait()
-            if not retry:
-                return None
+                        try:
+                            self._process_commands(
+                                script.split('\n'), need_ack=False)
+                        except TemperatureWaitCancelled:
+                            return self.SCRIPT_CANCELLED
+                        finally:
+                            if wait is not None and is_control:
+                                self._wake_temperature_wait()
+                if not retry:
+                    return None
+        finally:
+            if cancel_token is not None:
+                self._finish_or_defer_cancel_transaction(
+                    cancel_token, cancel_wait)
     def get_mutex(self):
         return self.mutex
     def create_gcode_command(self, command, commandline, params):
