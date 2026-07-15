@@ -1654,6 +1654,19 @@ path:
 #   A list of G-Code commands to execute when an error is reported.
 #   See docs/Command_Templates.md for G-Code format. The default is to
 #   run TURN_OFF_HEATERS.
+#cancelable_temperature_wait: False
+#   When True, standalone M109, M190, M191, and TEMPERATURE_WAIT lines
+#   dispatched from a virtual SD file stop before the next file line without
+#   entering PAUSE. The virtual SD print remains active and other G-Code
+#   sources may change heater targets or cancel the print. A wait reached
+#   from a different top-level macro, such as START_PRINT, retains the normal
+#   blocking behavior so subsequent macro commands cannot execute early.
+#   Custom M109/M190/M191 wrappers must place their wait last. The default is
+#   False.
+#temperature_wait_check_interval: 0.25
+#   Time in seconds between virtual SD temperature checks when the above
+#   option is enabled. The valid range is greater than zero and no more than
+#   one second. The default is 0.25 seconds.
 ```
 
 ### [sdcard_loop]

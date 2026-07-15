@@ -345,9 +345,22 @@ class PrinterHeaters:
         did_ack = gcmd.ack(msg)
         if not did_ack:
             gcmd.respond_raw(msg)
+    def _start_virtual_sd_temperature_wait(self, sensor_name, check_ready,
+                                           get_target):
+        virtual_sd = self.printer.lookup_object('virtual_sdcard', None)
+        if virtual_sd is None:
+            return False
+        return virtual_sd.begin_temperature_wait(
+            sensor_name, check_ready, get_target)
     def _wait_for_temperature(self, heater):
         # Helper to wait on heater.check_busy() and report M105 temperatures
         if self.printer.get_start_args().get('debugoutput') is not None:
+            return
+        if self._start_virtual_sd_temperature_wait(
+                heater.get_name(),
+                lambda eventtime: (heater.get_temp(eventtime)[1] <= 0.
+                                   or not heater.check_busy(eventtime)),
+                lambda eventtime: heater.get_temp(eventtime)[1]):
             return
         toolhead = self.printer.lookup_object("toolhead")
         gcode = self.printer.lookup_object("gcode")
@@ -366,23 +379,53 @@ class PrinterHeaters:
     cmd_TEMPERATURE_WAIT_help = "Wait for a temperature on a sensor"
     def cmd_TEMPERATURE_WAIT(self, gcmd):
         sensor_name = gcmd.get('SENSOR')
+        follow_target = gcmd.get_int('FOLLOW_TARGET', 0, minval=0, maxval=1)
         min_temp = gcmd.get_float('MINIMUM', float('-inf'))
         max_temp = gcmd.get_float('MAXIMUM', float('inf'), above=min_temp)
-        if min_temp == float('-inf') and max_temp == float('inf'):
+        if (follow_target
+            and (min_temp != float('-inf') or max_temp != float('inf'))):
             raise gcmd.error(
-                "Error on 'TEMPERATURE_WAIT': missing MINIMUM or MAXIMUM.")
+                "Error on 'TEMPERATURE_WAIT': FOLLOW_TARGET may not be "
+                "combined with MINIMUM or MAXIMUM.")
+        if (not follow_target and min_temp == float('-inf')
+            and max_temp == float('inf')):
+            raise gcmd.error(
+                "Error on 'TEMPERATURE_WAIT': missing FOLLOW_TARGET, "
+                "MINIMUM, or MAXIMUM.")
         if self.printer.get_start_args().get('debugoutput') is not None:
             return
         if sensor_name in self.heaters:
             sensor = self.heaters[sensor_name]
         else:
             sensor = self.printer.lookup_object(sensor_name)
+        if follow_target and not isinstance(sensor, Heater):
+            raise gcmd.error(
+                "Error on 'TEMPERATURE_WAIT': FOLLOW_TARGET requires a "
+                "heater sensor.")
+
+        if follow_target:
+            def check_ready(eventtime):
+                temp, target = sensor.get_temp(eventtime)
+                return target <= 0. or temp >= target
+            def get_target(eventtime):
+                return sensor.get_temp(eventtime)[1]
+        else:
+            def check_ready(eventtime):
+                temp, target = sensor.get_temp(eventtime)
+                return temp >= min_temp and temp <= max_temp
+            def get_target(eventtime):
+                if min_temp != float('-inf'):
+                    return min_temp
+                return max_temp
+
+        if self._start_virtual_sd_temperature_wait(
+                sensor_name, check_ready, get_target):
+            return
         toolhead = self.printer.lookup_object("toolhead")
         reactor = self.printer.get_reactor()
         eventtime = reactor.monotonic()
         while not self.printer.is_shutdown():
-            temp, target = sensor.get_temp(eventtime)
-            if temp >= min_temp and temp <= max_temp:
+            if check_ready(eventtime):
                 return
             print_time = toolhead.get_last_move_time()
             gcmd.respond_raw(self._get_temp(eventtime))

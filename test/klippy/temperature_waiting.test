@@ -1,0 +1,8 @@
+# Virtual SD cancelable temperature wait configuration tests
+DICTIONARY atmega2560.dict
+CONFIG temperature_waiting.cfg
+
+TEMPERATURE_WAIT SENSOR=extruder FOLLOW_TARGET=1
+TEMPERATURE_WAIT SENSOR=heater_bed FOLLOW_TARGET=1
+TEMPERATURE_WAIT SENSOR=extruder MINIMUM=10
+TEMPERATURE_WAIT SENSOR=heater_bed MAXIMUM=100

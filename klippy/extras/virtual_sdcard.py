@@ -3,9 +3,14 @@
 # Copyright (C) 2018-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import os, sys, logging, io
+import os, sys, logging, io, re
 
 VALID_GCODE_EXTS = ['gcode', 'g', 'gco']
+TEMPERATURE_WAIT_COMMANDS = frozenset([
+    'M109', 'M190', 'M191', 'TEMPERATURE_WAIT',
+])
+GCODE_COMMAND_R = re.compile(
+    r'^(?:N[0-9]+\s*)?([A-Z_]+[0-9]*(?:\.[0-9]+)?)')
 
 DEFAULT_ERROR_GCODE = """
 {% if 'heaters' in printer %}
@@ -21,6 +26,16 @@ class VirtualSD:
         self.sdcard_dirname = os.path.normpath(os.path.expanduser(sd))
         self.current_file = None
         self.file_position = self.file_size = 0
+        # Optional non-blocking temperature wait support.  A temperature
+        # wait keeps the virtual SD print active while temporarily stopping
+        # file dispatch between G-Code lines.  As the wait runs outside of
+        # gcode.run_script(), other G-Code sources remain responsive.
+        self.cancelable_temperature_wait = config.getboolean(
+            'cancelable_temperature_wait', False)
+        self.temperature_wait_check_interval = config.getfloat(
+            'temperature_wait_check_interval', 0.25, above=0., maxval=1.)
+        self.temperature_wait = None
+        self.active_file_command = None
         # Print Stat Tracking
         self.print_stats = self.printer.load_object(config, 'print_stats')
         # Work timer
@@ -47,6 +62,7 @@ class VirtualSD:
         self.printer.register_event_handler("klippy:analyze_shutdown",
                                             self._handle_analyze_shutdown)
     def _handle_analyze_shutdown(self, msg, details):
+        self._clear_temperature_wait()
         if self.work_timer is not None:
             self.must_pause_work = True
             try:
@@ -90,12 +106,22 @@ class VirtualSD:
                 logging.exception("virtual_sdcard get_file_list")
                 raise self.gcode.error("Unable to get file list")
     def get_status(self, eventtime):
+        tw_sensor = tw_target = None
+        if self.temperature_wait is not None:
+            tw_sensor = self.temperature_wait['sensor']
+            try:
+                tw_target = self.temperature_wait['get_target'](eventtime)
+            except Exception:
+                logging.exception("virtual_sdcard temperature target query")
         return {
             'file_path': self.file_path(),
             'progress': self.progress(),
             'is_active': self.is_active(),
             'file_position': self.file_position,
             'file_size': self.file_size,
+            'temperature_waiting': self.temperature_wait is not None,
+            'temperature_wait_sensor': tw_sensor,
+            'temperature_wait_target': tw_target,
         }
     def file_path(self):
         if self.current_file:
@@ -108,6 +134,41 @@ class VirtualSD:
             return 0.
     def is_active(self):
         return self.work_timer is not None
+    def _get_file_command(self, line):
+        # Track the command from the physical file line, rather than a
+        # command produced by a macro.  Deferring a wait is only safe after
+        # a standalone temperature-wait line has fully returned.
+        line = line.lstrip().upper()
+        match = GCODE_COMMAND_R.match(line)
+        if match is None:
+            return None
+        return match.group(1)
+    def begin_temperature_wait(self, sensor, check_ready, get_target):
+        if (not self.cancelable_temperature_wait or not self.cmd_from_sd
+            or self.active_file_command not in TEMPERATURE_WAIT_COMMANDS):
+            return False
+        if self.temperature_wait is not None:
+            raise self.gcode.error(
+                "A virtual SD temperature wait is already active")
+        self.temperature_wait = {
+            'sensor': sensor,
+            'check_ready': check_ready,
+            'get_target': get_target,
+        }
+        logging.info("Virtual SD temperature wait started for %s", sensor)
+        return True
+    def _clear_temperature_wait(self):
+        if self.temperature_wait is not None:
+            logging.info("Virtual SD temperature wait finished for %s",
+                         self.temperature_wait['sensor'])
+        self.temperature_wait = None
+    def _temperature_wait_ready(self, eventtime):
+        if self.temperature_wait is None:
+            return True
+        if not self.temperature_wait['check_ready'](eventtime):
+            return False
+        self._clear_temperature_wait()
+        return True
     def do_pause(self):
         if self.work_timer is not None:
             self.must_pause_work = True
@@ -120,6 +181,7 @@ class VirtualSD:
         self.work_timer = self.reactor.register_timer(
             self.work_handler, self.reactor.NOW)
     def do_cancel(self):
+        self._clear_temperature_wait()
         if self.current_file is not None:
             self.do_pause()
             self.current_file.close()
@@ -130,6 +192,7 @@ class VirtualSD:
     def cmd_error(self, gcmd):
         raise gcmd.error("SD write not supported")
     def _reset_file(self):
+        self._clear_temperature_wait()
         if self.current_file is not None:
             self.do_pause()
             self.current_file.close()
@@ -237,6 +300,40 @@ class VirtualSD:
         lines = []
         error_message = None
         while not self.must_pause_work:
+            # A temperature wait deliberately stops before the next file
+            # line, but it does not enter Klipper's PAUSE state.  This loop
+            # is outside gcode.run_script() and therefore does not own the
+            # G-Code mutex; Mainsail may change targets or cancel the job.
+            if self.temperature_wait is not None:
+                try:
+                    eventtime = self.reactor.monotonic()
+                    if self._temperature_wait_ready(eventtime):
+                        self.reactor.pause(self.reactor.NOW)
+                    else:
+                        self.reactor.pause(
+                            eventtime + self.temperature_wait_check_interval)
+                    continue
+                except self.gcode.error as e:
+                    error_message = str(e)
+                    self.cmd_from_sd = True
+                    try:
+                        self.gcode.run_script(self.on_error_gcode.render())
+                    except:
+                        logging.exception("virtual_sdcard on_error")
+                    finally:
+                        self.cmd_from_sd = False
+                    break
+                except:
+                    logging.exception("virtual_sdcard temperature wait")
+                    error_message = "Internal error during temperature wait"
+                    self.cmd_from_sd = True
+                    try:
+                        self.gcode.run_script(self.on_error_gcode.render())
+                    except:
+                        logging.exception("virtual_sdcard on_error")
+                    finally:
+                        self.cmd_from_sd = False
+                    break
             if not lines:
                 # Read more data
                 try:
@@ -264,6 +361,7 @@ class VirtualSD:
             # Dispatch command
             self.cmd_from_sd = True
             line = lines.pop()
+            self.active_file_command = self._get_file_command(line)
             if sys.version_info.major >= 3:
                 next_file_position = self.file_position + len(line.encode()) + 1
             else:
@@ -273,6 +371,7 @@ class VirtualSD:
                 self.gcode.run_script(line)
             except self.gcode.error as e:
                 error_message = str(e)
+                self.active_file_command = None
                 try:
                     self.gcode.run_script(self.on_error_gcode.render())
                 except:
@@ -281,6 +380,8 @@ class VirtualSD:
             except:
                 logging.exception("virtual_sdcard dispatch")
                 break
+            finally:
+                self.active_file_command = None
             self.cmd_from_sd = False
             self.file_position = self.next_file_position
             # Do we need to skip around?
@@ -296,11 +397,14 @@ class VirtualSD:
         logging.info("Exiting SD card print (position %d)", self.file_position)
         self.work_timer = None
         self.cmd_from_sd = False
+        self.active_file_command = None
         if error_message is not None:
+            self._clear_temperature_wait()
             self.print_stats.note_error(error_message)
         elif self.current_file is not None:
             self.print_stats.note_pause()
         else:
+            self._clear_temperature_wait()
             self.print_stats.note_complete()
         return self.reactor.NEVER
 
