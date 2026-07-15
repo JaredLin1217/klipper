@@ -175,14 +175,14 @@ class UniversalWaitHarness(unittest.TestCase):
 
     def cmd_TURN_OFF_HEATERS(self, gcmd):
         self.temperature['target'] = 0.
+        self.other_heater_target = 0.
         self.trace.append('turn_off_heaters')
 
     def cmd_M109(self, gcmd):
         target = gcmd.get_float('S', self.temperature['target'])
         self.temperature['target'] = target
         self.trace.append(('wait', target))
-        target_wait = heaters.HeaterTargetWait(
-            self.heater, self.gcode.cancel_temperature_wait)
+        target_wait = heaters.HeaterTargetWait(self.heater)
         if self.virtual_sd is not None:
             self.virtual_sd.begin_temperature_wait(
                 'extruder', target_wait.check_ready,
@@ -409,8 +409,7 @@ class UniversalTemperatureWaitingTest(UniversalWaitHarness):
 
         def racy_wait(gcmd):
             self.temperature['target'] = 100.
-            target_wait = heaters.HeaterTargetWait(
-                self.heater, self.gcode.cancel_temperature_wait)
+            target_wait = heaters.HeaterTargetWait(self.heater)
             # Keep the mutex while the higher-target setter enters its queue.
             self.reactor.pause(.1)
             self.gcode.wait_for_temperature(
@@ -439,8 +438,7 @@ class UniversalTemperatureWaitingTest(UniversalWaitHarness):
 
         def racy_wait(gcmd):
             self.temperature['target'] = 100.
-            target_wait = heaters.HeaterTargetWait(
-                self.heater, self.gcode.cancel_temperature_wait)
+            target_wait = heaters.HeaterTargetWait(self.heater)
             self.reactor.pause(.1)
             self.gcode.wait_for_temperature(
                 target_wait.check_ready, .25)
@@ -462,7 +460,7 @@ class UniversalTemperatureWaitingTest(UniversalWaitHarness):
         self.assertNotIn('owner_after', snapshots[0])
         self.assertIn('owner_after', self.trace)
 
-    def test_turn_off_heaters_cancels_waiting_script(self):
+    def test_turn_off_heaters_releases_wait_and_continues_script(self):
         owner_result = []
 
         def start(eventtime):
@@ -475,8 +473,28 @@ class UniversalTemperatureWaitingTest(UniversalWaitHarness):
         self.run_until()
 
         self.assertIn('turn_off_heaters', self.trace)
-        self.assertNotIn('owner_after', self.trace)
-        self.assertEqual([self.gcode.SCRIPT_CANCELLED], owner_result)
+        self.assertIn('owner_after', self.trace)
+        self.assertEqual([None], owner_result)
+        self.assertEqual(0., self.other_heater_target)
+
+    def test_zero_target_continues_nested_macro_stack(self):
+        owner_result = []
+
+        def start(eventtime):
+            owner_result.append(self.gcode.run_script(
+                "OUTER_WAIT\nMARK NAME=top_after"))
+
+        self.schedule(0., start)
+        self.schedule(.1, lambda eventtime: self.set_target(0.))
+        self.run_until()
+
+        self.assertIn('inner_after', self.trace)
+        self.assertIn('outer_after', self.trace)
+        self.assertIn('top_after', self.trace)
+        self.assertNotIn('cancel_before', self.trace)
+        self.assertNotIn('cancel_base', self.trace)
+        self.assertEqual([None], owner_result)
+        self.assertEqual(60., self.other_heater_target)
 
     def test_wait_error_discards_queued_unsafe_command(self):
         owner_errors = []
@@ -723,7 +741,7 @@ class UniversalTemperatureWaitingTest(UniversalWaitHarness):
         self.assertNotIn('file_after', self.trace)
         self.assertFalse(self.printer.shutdown)
 
-    def test_virtual_sd_zero_target_runs_cancel_cleanup(self):
+    def test_virtual_sd_zero_target_continues_file(self):
         vsd, stats = self.build_virtual_sd(
             "M109 S100\nMARK NAME=file_after\n")
 
@@ -731,85 +749,14 @@ class UniversalTemperatureWaitingTest(UniversalWaitHarness):
         self.schedule(.1, lambda eventtime: self.set_target(0.))
         self.run_until()
 
-        self.assertEqual('cancelled', stats.state)
+        self.assertEqual('complete', stats.state)
         self.assertIsNone(vsd.current_file)
         self.assertIsNone(vsd.temperature_wait)
-        self.assertEqual(0, vsd.file_position)
-        self.assertEqual(0, vsd.file_size)
-        self.assertIn('cancel_before', self.trace)
-        self.assertIn('cancel_base', self.trace)
-        self.assertIn('cancel_after', self.trace)
-        self.assertEqual(0., self.other_heater_target)
-        self.assertNotIn('file_after', self.trace)
-        self.assertFalse(self.printer.shutdown)
-
-    def test_zero_target_and_user_cancel_share_one_transaction(self):
-        vsd, stats = self.build_virtual_sd(
-            "M109 S100\nMARK NAME=file_after\n")
-        self.gcode.register_command('CANCEL_PRINT', None)
-        duplicate_results = []
-
-        def slow_cancel(gcmd):
-            self.trace.append('slow_cancel_begin')
-            self.virtual_sd.do_cancel()
-            self.reactor.pause(self.reactor.monotonic() + .2)
-            self.trace.append('slow_cancel_end')
-
-        self.gcode.register_command('CANCEL_PRINT', slow_cancel)
-
-        vsd.work_timer = self.reactor.register_timer(vsd.work_handler, 0.)
-        self.schedule(.1, lambda eventtime: self.set_target(0.))
-        self.schedule(.15, lambda eventtime:
-                      duplicate_results.append(
-                          self.gcode.run_script("CANCEL_PRINT")))
-        self.run_until()
-
-        self.assertEqual(1, self.trace.count('slow_cancel_begin'))
-        self.assertEqual(1, self.trace.count('slow_cancel_end'))
-        self.assertEqual([self.gcode.SCRIPT_CANCELLED], duplicate_results)
-        self.assertEqual('cancelled', stats.state)
-        self.assertNotIn('file_after', self.trace)
-        self.assertIsNone(self.gcode.active_cancel_transaction)
-        self.assertFalse(self.printer.shutdown)
-
-    def test_cancel_token_survives_control_queue_before_owner_unwind(self):
-        vsd, stats = self.build_virtual_sd(
-            "M109 S100\nMARK NAME=file_after\n")
-        self.gcode.register_command('CANCEL_PRINT', None)
-        duplicate_results = []
-
-        def slow_cancel(gcmd):
-            self.trace.append('slow_cancel_begin')
-            self.virtual_sd.do_cancel()
-            self.reactor.pause(self.reactor.monotonic() + .2)
-            self.trace.append('slow_cancel_end')
-
-        def slow_control(gcmd):
-            self.trace.append('slow_control_begin')
-            self.reactor.pause(self.reactor.monotonic() + .2)
-            self.trace.append('slow_control_end')
-
-        self.gcode.register_command('CANCEL_PRINT', slow_cancel)
-        self.gcode.register_command(
-            'SLOW_CONTROL', slow_control, during_temperature_wait=True)
-
-        vsd.work_timer = self.reactor.register_timer(vsd.work_handler, 0.)
-        self.schedule(.1, lambda eventtime: self.set_target(0.))
-        self.schedule(.15, lambda eventtime:
-                      self.gcode.run_script("SLOW_CONTROL"))
-        self.schedule(.35, lambda eventtime:
-                      duplicate_results.append(
-                          self.gcode.run_script("CANCEL_PRINT")))
-        self.run_until()
-
-        self.assertEqual(1, self.trace.count('slow_cancel_begin'))
-        self.assertEqual(1, self.trace.count('slow_cancel_end'))
-        self.assertEqual(1, self.trace.count('slow_control_begin'))
-        self.assertEqual(1, self.trace.count('slow_control_end'))
-        self.assertEqual([self.gcode.SCRIPT_CANCELLED], duplicate_results)
-        self.assertEqual('cancelled', stats.state)
-        self.assertNotIn('file_after', self.trace)
-        self.assertIsNone(self.gcode.active_cancel_transaction)
+        self.assertIn('file_after', self.trace)
+        self.assertNotIn('cancel_before', self.trace)
+        self.assertNotIn('cancel_base', self.trace)
+        self.assertNotIn('cancel_after', self.trace)
+        self.assertEqual(60., self.other_heater_target)
         self.assertFalse(self.printer.shutdown)
 
     def test_feature_disabled_does_not_register_wait(self):
@@ -862,7 +809,6 @@ class FakeVirtualSDWaitReceiver:
 
 class FakeTemperatureWaitDispatch:
     def __init__(self):
-        self.cancel_count = 0
         self.notify_count = 0
         self.responses = []
 
@@ -871,11 +817,6 @@ class FakeTemperatureWaitDispatch:
 
     def respond_raw(self, message):
         self.responses.append(message)
-
-    def cancel_temperature_wait(self):
-        self.cancel_count += 1
-        raise gcode.TemperatureWaitCancelled()
-
 
 class FakeDisabledVirtualSD:
     def begin_temperature_wait(self, sensor, check_ready, get_target):
@@ -1053,15 +994,13 @@ class HeaterTemperatureWaitingTest(unittest.TestCase):
         temperature['actual'] = 95.
         self.assertTrue(check_ready(0.))
 
-    def test_zero_target_cancels_wait_instead_of_continuing(self):
+    def test_zero_target_finishes_wait_without_cancelling(self):
         temperature, dispatch, sensor, check_ready, get_target = \
             self.build_follow_target_wait()
         temperature['target'] = 0.
 
-        with self.assertRaises(gcode.TemperatureWaitCancelled):
-            check_ready(0.)
-        self.assertEqual(1, dispatch.cancel_count)
-        self.assertEqual(1, dispatch.notify_count)
+        self.assertTrue(check_ready(0.))
+        self.assertEqual(0, dispatch.notify_count)
 
     def test_native_temperature_wait_fallback_uses_cooling_tolerance(self):
         state = {}
@@ -1097,6 +1036,17 @@ class HeaterTemperatureWaitingTest(unittest.TestCase):
         self.assertEqual(1, reactor.pause_count)
         self.assertEqual(97., temperature['actual'])
         self.assertEqual(1, len(gcmd.responses))
+
+    def test_zero_target_fallback_continues_without_pause(self):
+        result = self.build_fallback_wait(actual=200., target=0.)
+        temperature, heater, reactor, dispatch, toolhead, pheaters = result
+        gcmd = FakeWaitGCode(SENSOR='extruder', FOLLOW_TARGET=1)
+
+        pheaters.cmd_TEMPERATURE_WAIT(gcmd)
+
+        self.assertEqual(0, reactor.pause_count)
+        self.assertEqual([], gcmd.responses)
+        self.assertEqual(0., temperature['target'])
 
     def test_follow_target_rejects_non_heater_sensor(self):
         class FakeSensor:

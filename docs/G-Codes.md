@@ -823,9 +823,10 @@ below the supplied MAXIMUM. `FOLLOW_TARGET=1` may be used instead of
 MINIMUM/MAXIMUM for a heater; it waits in either the heating or cooling
 direction until the heater reaches the tolerance configured by
 `temperature_wait_tolerance`. A live target change selects a new direction
-from the current smoothed temperature. If the latest waited target is zero,
-the wait turns off all heaters, runs the configured CANCEL_PRINT transaction,
-and aborts the waiting script instead of continuing it. When enabled by the
+from the current smoothed temperature. Changing the waited heater's target to
+zero immediately completes that wait and the current script continues; the
+wait itself does not cancel a print or alter any other heater target. When
+enabled by the
 virtual_sdcard configuration, temperature waits from virtual SD files, the
 Console, and nested macros keep their current script blocked while permitting
 heater target changes, temperature queries, CANCEL_PRINT, and M112 from other

@@ -999,7 +999,8 @@ sensor_pin:
 #   TEMPERATURE_WAIT FOLLOW_TARGET=1. A heating wait completes at
 #   target minus this value; a cooling wait completes at target plus
 #   this value. The direction is recalculated whenever the live target
-#   changes. The default is 3 degrees Celsius.
+#   changes. A zero target completes the wait immediately and does not
+#   use this tolerance. The default is 3 degrees Celsius.
 control:
 #   Control algorithm (either pid or watermark). This parameter must
 #   be provided.

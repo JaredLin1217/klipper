@@ -23,9 +23,8 @@ class HeaterTargetWait:
     HEATING = 1
     COOLING = -1
     WITHIN_TOLERANCE = 0
-    def __init__(self, heater, cancel_wait):
+    def __init__(self, heater):
         self.heater = heater
-        self.cancel_wait = cancel_wait
         self.tolerance = heater.get_temperature_wait_tolerance()
         self.target = None
         self.direction = self.WITHIN_TOLERANCE
@@ -40,10 +39,7 @@ class HeaterTargetWait:
     def check_ready(self, eventtime):
         temp, target = self.heater.get_temp(eventtime)
         if target <= 0.:
-            # Zero is not a reachable temperature target.  Clearing a target
-            # while waiting must not let the remainder of a print continue.
-            self.cancel_wait()
-            return False
+            return True
         if (target != self.target
             or self.direction == self.WITHIN_TOLERANCE):
             self._update_direction(temp, target)
@@ -402,13 +398,7 @@ class PrinterHeaters:
         return virtual_sd.begin_temperature_wait(
             sensor_name, check_ready, get_target)
     def _new_heater_target_wait(self, heater):
-        gcode = self.printer.lookup_object("gcode")
-        def cancel_wait():
-            # A zero target means the user stopped the wait.  Shut down every
-            # heater before running the configured CANCEL_PRINT transaction.
-            self.turn_off_all_heaters()
-            gcode.cancel_temperature_wait()
-        return HeaterTargetWait(heater, cancel_wait)
+        return HeaterTargetWait(heater)
     def _wait_for_temperature(self, heater):
         # Helper to wait on the heater's live target and report temperatures.
         if self.printer.get_start_args().get('debugoutput') is not None:
