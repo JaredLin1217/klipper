@@ -1418,9 +1418,10 @@ the nature of skew correction these lengths are set via gcode. See
 ### [z_thermal_adjust]
 
 Temperature-dependant toolhead Z position adjustment. Compensate for vertical
-toolhead movement caused by thermal expansion of the printer's frame in
-real-time using a temperature sensor (typically coupled to a vertical section
-of frame).
+toolhead movement caused by thermal expansion of the printer in real-time.
+The module may use either one directly configured temperature sensor or
+multiple named temperature sources with independent coefficients and reference
+temperatures.
 
 See also: [extended g-code commands](G-Codes.md#z_thermal_adjust).
 
@@ -1453,6 +1454,36 @@ See also: [extended g-code commands](G-Codes.md#z_thermal_adjust).
 #   See the "heater_generic" section for the definition of this
 #   parameter.
 ```
+
+The `sensor_type` options above select the original single-sensor mode. To
+combine independent temperature variables, omit `sensor_type` from the main
+section and define one or more named source sections instead:
+
+```
+[z_thermal_adjust source_name]
+sensor:
+#   Name of an existing printer object that reports a "temperature" status
+#   field, such as "heater_bed", "extruder", "heater_generic chamber", or
+#   "temperature_sensor frame". This parameter must be provided.
+#temp_coeff:
+#   Temperature coefficient for this source in mm/degC. A positive value moves
+#   the Z axis downwards as this source warms, while a negative value moves it
+#   upwards. The default is 0.0 mm/degC.
+#reference_temperature:
+#   Fixed reference temperature for this source. If omitted, the source
+#   temperature measured at Z homing is used. A SET_Z_THERMAL_ADJUST REF_TEMP
+#   override is reset to this configured value (or recaptured when omitted)
+#   after the next Z homing operation.
+#smooth_time:
+#   Smoothing time for this source in seconds. The default is the smooth_time
+#   from the main [z_thermal_adjust] section.
+```
+
+Each named source contributes
+`-temp_coeff * (temperature - reference_temperature)` millimeters. The
+contributions are summed before `max_z_adjustment` is applied. Configuring
+both `sensor_type` in the main section and named source sections is not
+permitted.
 
 ## Customized homing
 

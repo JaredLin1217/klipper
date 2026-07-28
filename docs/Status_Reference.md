@@ -637,13 +637,34 @@ object is always available):
 The following information is available in the `z_thermal_adjust` object (this
 object is available if [z_thermal_adjust](Config_Reference.md#z_thermal_adjust)
 is defined).
+- `mode`: Returns `single_sensor` for the original sensor configuration or
+  `multi_source` when named temperature sources are configured.
 - `enabled`: Returns True if adjustment is enabled.
+- `current_z_adjust`: Last computed Z adjustment [mm].
+- `target_z_adjust`: Current limited adjustment calculated from the
+  temperature model [mm]. It may differ from `current_z_adjust` until an
+  eligible toolhead move applies it.
+- `unclamped_z_adjust`: Adjustment calculated before applying
+  `max_z_adjustment` [mm].
+- `limit_active`: Returns True when `max_z_adjustment` is limiting the
+  calculated adjustment.
+
+The following fields are also available in `single_sensor` mode:
 - `temperature`: Current (smoothed) temperature of the defined sensor. [degC]
 - `measured_min_temp`: Minimum measured temperature. [degC]
 - `measured_max_temp`: Maximum measured temperature. [degC]
-- `current_z_adjust`: Last computed Z adjustment [mm].
-- `z_adjust_ref_temperature`: Current reference temperature used for calculation
-  of Z `current_z_adjust` [degC].
+- `z_adjust_ref_temperature`: Current reference temperature used for
+  calculation of Z `current_z_adjust` [degC].
+
+These single-sensor compatibility fields return `None` in `multi_source` mode.
+
+The following fields are also available in `multi_source` mode:
+- `model_ready`: Returns True after every configured source has a valid
+  temperature and reference temperature.
+- `sources`: A dictionary keyed by source name. Each source contains
+  `sensor`, `available`, `temperature`, `raw_temperature`, `measured_min_temp`,
+  `measured_max_temp`, `temp_coeff`, `reference_temperature`,
+  `reference_is_manual`, `delta_temperature`, and `contribution`.
 
 ## z_tilt
 

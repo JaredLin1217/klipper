@@ -1738,7 +1738,8 @@ The following commands are available when the
 is enabled.
 
 #### SET_Z_THERMAL_ADJUST
-`SET_Z_THERMAL_ADJUST [ENABLE=<0:1>] [TEMP_COEFF=<value>] [REF_TEMP=<value>]`:
+`SET_Z_THERMAL_ADJUST [ENABLE=<0:1>] [SOURCE=<name>]
+[TEMP_COEFF=<value>] [REF_TEMP=<value>]`:
 Enable or disable the Z thermal adjustment with `ENABLE`. Disabling does not
 remove any adjustment already applied, but will freeze the current adjustment
 value - this prevents potentially unsafe downward Z movement. Re-enabling can
@@ -1748,6 +1749,12 @@ potentially cause upward tool movement as the adjustment is updated and applied.
 the config. `REF_TEMP` manually overrides the reference temperature typically
 set during homing (for use in e.g. non-standard homing routines) - will be reset
 automatically upon homing.
+
+When named `[z_thermal_adjust <name>]` sources are configured, `SOURCE` is
+required when setting `TEMP_COEFF` or `REF_TEMP`. The source-specific values
+are not saved to the config. With no parameters, the command reports all
+configured sources, their individual adjustment contributions, and the total
+target and applied adjustments.
 
 ### [z_tilt]
 

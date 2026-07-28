@@ -1,0 +1,8 @@
+# Legacy single-sensor Z thermal adjustment test
+DICTIONARY atmega2560.dict
+CONFIG z_thermal_adjust_legacy.cfg
+
+SET_Z_THERMAL_ADJUST
+SET_Z_THERMAL_ADJUST TEMP_COEFF=-0.005 REF_TEMP=15
+SET_Z_THERMAL_ADJUST ENABLE=0
+SET_Z_THERMAL_ADJUST ENABLE=1
