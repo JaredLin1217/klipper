@@ -106,7 +106,7 @@ class ZThermalSource:
         delta_t = self.smoothed_temp - self.ref_temperature
         return -1. * self.temp_coeff * delta_t
 
-    def get_status(self):
+    def get_status(self, eventtime=None):
         contribution = self.get_contribution()
         delta_t = None
         if self.smoothed_temp is not None and self.ref_temperature is not None:

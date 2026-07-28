@@ -143,6 +143,16 @@ class ZThermalSourceTest(unittest.TestCase):
         self.assertFalse(source.available)
         self.assertIsNone(source.get_contribution())
 
+    def test_status_accepts_webhooks_eventtime(self):
+        printer, sensor, source = self.make_source({
+            'temp_coeff': -0.002,
+            'reference_temperature': 20.,
+        }, temperature=40.)
+        source.update_temperature(0.)
+        status = source.get_status(1.)
+        self.assertEqual(status['temperature'], 40.)
+        self.assertAlmostEqual(status['contribution'], 0.04)
+
 
 class ZThermalModelTest(unittest.TestCase):
     def make_adjuster(self, contributions, limit):
