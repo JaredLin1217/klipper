@@ -19,6 +19,8 @@ class ShellCommand:
         self.command = shlex.split(cmd)
         self.timeout = config.getfloat("timeout", 2.0, above=0.0)
         self.verbose = config.getboolean("verbose", True)
+        # Control progress banners separately from actual command output.
+        self.verbose_status = config.getboolean("verbose_status", True)
         self.proc_fd = None
         self.partial_output = ""
         self.gcode.register_mux_command(
@@ -65,7 +67,8 @@ class ShellCommand:
             raise self.gcode.error("Error running command {%s}" % (self.name))
         if self.verbose:
             self.proc_fd = proc.stdout.fileno()
-            self.gcode.respond_info("Running Command {%s}...:" % (self.name))
+            if self.verbose_status:
+                self.gcode.respond_info("Running Command {%s}...:" % (self.name))
             hdl = reactor.register_fd(self.proc_fd, self._process_output)
         eventtime = reactor.monotonic()
         endtime = eventtime + self.timeout
@@ -85,7 +88,8 @@ class ShellCommand:
                 msg = "Command {%s} finished\n" % (self.name)
             else:
                 msg = "Command {%s} timed out" % (self.name)
-            self.gcode.respond_info(msg)
+            if not complete or self.verbose_status:
+                self.gcode.respond_info(msg)
             reactor.unregister_fd(hdl)
             self.proc_fd = None
 
