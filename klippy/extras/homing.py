@@ -345,14 +345,22 @@ class PrinterHoming:
         homing_state = Homing(self.printer)
         homing_state.set_axes(axes)
         kin = self.printer.lookup_object('toolhead').get_kinematics()
+        manual = self.printer.lookup_object('manual_probe', None)
+        z_offset_state = None
+        if manual is not None and hasattr(manual, 'prepare_z_offset_homing'):
+            z_offset_state = manual.prepare_z_offset_homing(axes)
         try:
             kin.home(homing_state)
         except self.printer.command_error:
+            if z_offset_state is not None:
+                manual.finish_z_offset_homing(z_offset_state, False)
             if self.printer.is_shutdown():
                 raise self.printer.command_error(
                     "Homing failed due to printer shutdown")
             self.printer.lookup_object('stepper_enable').motor_off()
             raise
+        if z_offset_state is not None:
+            manual.finish_z_offset_homing(z_offset_state, True)
 
 def load_config(config):
     return PrinterHoming(config)

@@ -3,7 +3,7 @@
 # Copyright (C) 2019-2026  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import logging, bisect, collections
+import logging, bisect, collections, math
 
 # Main probe results tuple.  The probe estimates that if the toolhead
 # is commanded to xy position [bed_x, bed_y] and then descends, the
@@ -78,6 +78,136 @@ class ManualProbe:
                 self.cmd_Z_OFFSET_APPLY_DELTA_ENDSTOPS,
                 desc=self.cmd_Z_OFFSET_APPLY_ENDSTOP_help)
         self.reset_status()
+        self.pending_z_offset = None
+        self.last_z_offset_save = {'saved': False, 'applied': False,
+                                   'deferred': False, 'error': ''}
+        if (self.z_position_endstop is not None and
+                config.getsection('printer').get('kinematics') in
+                ('cartesian', 'corexy')):
+            aio = self.printer.load_object(config, 'aio_executor')
+            self.z_save_executor = aio.allocate_executor('z_offset_save')
+            self.gcode.register_command('_Z_OFFSET_SAVE_ENDSTOP',
+                                        self.cmd_Z_OFFSET_SAVE_ENDSTOP,
+                                        desc='Persist the Z endstop without restart')
+            self.gcode.register_command('_Z_OFFSET_HOME_SAVED',
+                                        self.cmd_Z_OFFSET_HOME_SAVED,
+                                        desc='Home after saving only when no print is active')
+            self.printer.register_event_handler('klippy:connect',
+                                                self._register_z_result_macros)
+    def _register_z_result_macros(self):
+        for name in ('_Z_OFFSET_SHOW_RESULT', '_Z_OFFSET_RAISE_ERROR',
+                     '_Z_OFFSET_CLOSE_RESULT'):
+            macro = self.printer.lookup_object('gcode_macro ' + name, None)
+            if macro is not None:
+                self.gcode.register_command(name, None)
+                self.gcode.register_command(name, macro.cmd,
+                                            when_not_ready=True,
+                                            desc=macro.cmd_desc)
+    def _get_z_rail(self):
+        kin = self.printer.lookup_object('toolhead').get_kinematics()
+        for rail in kin.rails:
+            if rail.get_name() == self.z_endstop_config_name:
+                if any(hasattr(es, 'get_position_endstop')
+                       for es, name in rail.get_endstops()):
+                    raise self.printer.command_error(
+                        'Z offset saving requires an independent Z endstop')
+                return rail
+        raise self.printer.command_error('Unable to find the Z endstop rail')
+    def _print_active(self):
+        eventtime = self.printer.get_reactor().monotonic()
+        stats = self.printer.lookup_object('print_stats', None)
+        pause = self.printer.lookup_object('pause_resume', None)
+        sd = self.printer.lookup_object('virtual_sdcard', None)
+        return bool((stats is not None and stats.get_status(eventtime)['state']
+                     in ('printing', 'paused')) or
+                    (pause is not None and pause.is_paused) or
+                    (sd is not None and sd.is_active()))
+    def _tool_z_offset(self):
+        tool = self.printer.lookup_object('toolhead').get_extruder().get_name()
+        if tool == 'extruder':
+            return 0.
+        saved = self.printer.lookup_object('save_variables', None)
+        if tool != 'extruder1' or saved is None or 't1_z' not in saved.allVariables:
+            raise self.printer.command_error('Unable to identify the tool Z offset')
+        value = float(saved.allVariables['t1_z'])
+        if not math.isfinite(value):
+            raise self.printer.command_error('Tool Z offset must be finite')
+        return value
+    def cmd_Z_OFFSET_SAVE_ENDSTOP(self, gcmd):
+        raise_error = gcmd.get_int('RAISE_ON_ERROR', 1, minval=0, maxval=1)
+        self.last_z_offset_save = {'saved': False, 'applied': False,
+                                  'deferred': False, 'error': ''}
+        try:
+            if self.status['is_active']:
+                raise gcmd.error('Finish manual probing before saving a Z offset')
+            probe = self.printer.lookup_object('vulcan_probe', None)
+            if probe is not None and (probe.calibrating or probe.meshing):
+                raise gcmd.error('Finish probe calibration before saving a Z offset')
+            rail = self._get_z_rail()
+            origin = self.gcode_move.get_status()['homing_origin'].z
+            offset = origin - self._tool_z_offset()
+            value = float('%.3f' % (self.z_position_endstop - offset,))
+            low, high = rail.get_range()
+            if not math.isfinite(offset) or not math.isfinite(value) or not low <= value <= high:
+                raise gcmd.error('Saved Z endstop must be finite and inside the axis range')
+            self.printer.lookup_object('configfile').save_z_endstop(
+                self.z_endstop_config_name, '%.3f' % (value,), self.z_save_executor)
+            # The active baseline stays unchanged until Z homing. Repeated saves
+            # therefore overwrite the target instead of accumulating the offset.
+            self.pending_z_offset = value
+            self.last_z_offset_save.update(
+                saved=True, deferred=self._print_active(), position_endstop=value,
+                saved_offset=self.z_position_endstop - value)
+        except Exception as exc:
+            self.last_z_offset_save['error'] = str(exc)
+            if raise_error:
+                raise gcmd.error(str(exc))
+    def cmd_Z_OFFSET_HOME_SAVED(self, gcmd):
+        result = self.last_z_offset_save
+        if not result['saved'] or result['error']:
+            return
+        # Check again after disk IO; the UI's earlier state is not authority.
+        result['deferred'] = self._print_active()
+        if result['deferred']:
+            return
+        try:
+            self.gcode.run_script_from_command('G28')
+        except Exception as exc:
+            result['error'] = str(exc)
+    def prepare_z_offset_homing(self, axes):
+        if 2 not in axes or self.pending_z_offset is None:
+            return None
+        rail = self._get_z_rail()
+        origin = self.gcode_move.get_status()['homing_origin'].z
+        if not math.isfinite(origin):
+            raise self.printer.command_error('Active Z offset must be finite')
+        state = (rail, rail.position_endstop, self.z_position_endstop, origin)
+        value = self.pending_z_offset
+        delta = self.z_position_endstop - value
+        # Remove only the persisted component. Keep tool compensation and any
+        # additional, unsaved babystep; MOVE=0 never moves the running print.
+        self._set_z_origin(origin - delta)
+        rail.position_endstop = self.z_position_endstop = value
+        return state
+    def _set_z_origin(self, value):
+        # Call the existing coordinate setter directly so failure recovery also
+        # works after an MCU shutdown. MOVE=0 never requests hardware motion.
+        command = self.gcode.create_gcode_command('SET_GCODE_OFFSET', '',
+                         {'Z': '%.9f' % (value,), 'MOVE': '0'})
+        self.gcode_move.cmd_SET_GCODE_OFFSET(command)
+    def finish_z_offset_homing(self, state, success):
+        if state is None:
+            return
+        rail, endstop, baseline, origin = state
+        if not success:
+            rail.position_endstop, self.z_position_endstop = endstop, baseline
+            self._set_z_origin(origin)
+            self.last_z_offset_save['applied'] = False
+            return
+        self.pending_z_offset = None
+        self.last_z_offset_save.update(applied=True, deferred=False)
+        self.printer.lookup_object('configfile').note_z_endstop_applied(
+            self.z_endstop_config_name, '%.3f' % (self.z_position_endstop,))
     def manual_probe_finalize(self, mpresult):
         if mpresult is not None:
             self.gcode.respond_info("Z position is %.3f" % (mpresult.bed_z,))
@@ -89,7 +219,11 @@ class ManualProbe:
             'z_position_upper': None
         }
     def get_status(self, eventtime):
-        return self.status
+        status = dict(self.status)
+        status['z_offset_save'] = dict(self.last_z_offset_save)
+        status['pending_z_endstop'] = self.pending_z_offset
+        status['active_z_endstop'] = self.z_position_endstop
+        return status
     cmd_MANUAL_PROBE_help = "Start manual probe helper script"
     def cmd_MANUAL_PROBE(self, gcmd):
         ManualProbeHelper(self.printer, gcmd, self.manual_probe_finalize)

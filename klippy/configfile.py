@@ -3,7 +3,7 @@
 # Copyright (C) 2016-2024  Kevin O'Connor <kevin@koconnor.net>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
-import sys, os, glob, re, time, logging, configparser, io
+import sys, os, glob, re, time, logging, configparser, io, tempfile
 
 error = configparser.Error
 
@@ -343,6 +343,86 @@ class ConfigAutoSave:
                            "with included value" % (section, option))
                     raise self.printer.command_error(msg)
                     
+    def save_z_endstop(self, section, value, executor):
+        # Read the persisted autosave block, not unrelated pending PID/mesh edits.
+        # The worker yields the reactor while disk IO is in progress.
+        executor.submit(self._write_z_endstop, section, value)
+        if not self.fileconfig.has_section(section):
+            self.fileconfig.add_section(section)
+        self.fileconfig.set(section, 'position_endstop', value)
+        pending = dict(self.status_save_pending)
+        remaining = dict(pending.get(section) or {})
+        remaining.pop('position_endstop', None)
+        if remaining:
+            pending[section] = remaining
+        else:
+            pending.pop(section, None)
+        self.status_save_pending = pending
+        self.save_config_pending = bool(pending)
+    def _write_z_endstop(self, section, value):
+        cfgrdr = ConfigFileReader()
+        cfgname = self.printer.get_start_args()['config_file']
+        original = cfgrdr.read_config_file(cfgname)
+        regular, autosave = self._find_autosave_data(original)
+        if '\n#*#' in regular:
+            raise self.printer.command_error('Config autosave is corrupted')
+        persisted = cfgrdr.build_fileconfig(autosave, cfgname)
+        if not persisted.has_section(section):
+            persisted.add_section(section)
+        persisted.set(section, 'position_endstop', value)
+        selected = configparser.RawConfigParser()
+        selected.add_section(section)
+        selected.set(section, 'position_endstop', value)
+        regular = self._strip_duplicates(regular, selected)
+        included = cfgrdr.build_fileconfig_with_includes(regular, cfgname)
+        for saved_section in persisted.sections():
+            for option in persisted.options(saved_section):
+                if included.has_option(saved_section, option):
+                    raise self.printer.command_error(
+                        "SAVE_CONFIG section '%s' option '%s' conflicts "
+                        "with included value" % (saved_section, option))
+        lines = [('#*# ' + line).strip() for line in
+                 cfgrdr.build_config_string(persisted).split('\n')]
+        new_data = (regular.rstrip() + '\n' + AUTOSAVE_HEADER.rstrip()
+                    + '\n' + '\n'.join(lines) + '\n')
+        if new_data == original:
+            return
+        # Resolve the target so atomic replacement preserves printer.cfg symlinks.
+        target = os.path.realpath(cfgname)
+        mode = os.stat(target).st_mode & 0o777
+        prefix, extension = os.path.splitext(cfgname)
+        backup = '%s-%s-%s%s' % (prefix,
+                 time.strftime('%Y%m%d_%H%M%S'), time.time_ns(), extension)
+        staging = None
+        try:
+            with open(backup, 'x', encoding='utf-8') as output:
+                output.write(original)
+                output.flush()
+                os.fsync(output.fileno())
+            with tempfile.NamedTemporaryFile(
+                    mode='w', encoding='utf-8', dir=os.path.dirname(target),
+                    prefix='.z-offset-', suffix='.pending', delete=False) as output:
+                staging = output.name
+                os.chmod(staging, mode)
+                output.write(new_data)
+                output.flush()
+                os.fsync(output.fileno())
+            os.replace(staging, target)
+            staging = None
+        finally:
+            if staging is not None and os.path.exists(staging):
+                os.unlink(staging)
+        # Prune only recognized timestamp backups after the new file is safe.
+        pattern = re.compile(re.escape(os.path.basename(prefix))
+                             + r'-\d{8}_\d{6}(?:-\d+)?'
+                             + re.escape(extension) + r'$')
+        backups = [path for path in glob.glob(prefix + '-*' + extension)
+                   if pattern.fullmatch(os.path.basename(path))]
+        for path in sorted(backups, key=os.path.getmtime, reverse=True)[5:]:
+            try:
+                os.unlink(path)
+            except OSError:
+                logging.exception('Unable to prune Z offset backup %s', path)
     cmd_SAVE_CONFIG_help = "Backup current config, then overwrite printer.cfg"
     def cmd_SAVE_CONFIG(self, gcmd):
         if not self.fileconfig.sections():
@@ -601,3 +681,8 @@ class PrinterConfig:
         self.autosave.set(section, option, value)
     def remove_section(self, section):
         self.autosave.remove_section(section)
+    def save_z_endstop(self, section, value, executor):
+        self.autosave.save_z_endstop(section, value, executor)
+    def note_z_endstop_applied(self, section, value):
+        self.status_raw_config.setdefault(section, {})['position_endstop'] = value
+        self.validate.status_settings.setdefault(section, {})['position_endstop'] = float(value)
