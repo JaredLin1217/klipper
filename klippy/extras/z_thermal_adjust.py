@@ -85,9 +85,14 @@ class ZThermalSource:
         return True
 
     def handle_z_homing(self):
+        if self.available and self.last_temp is not None:
+            # Establish a fresh measurement window at the home reference.
+            self.smoothed_temp = self.last_temp
         if self.config_ref_temperature is None:
-            if self.smoothed_temp is not None:
-                self.ref_temperature = self.smoothed_temp
+            if self.available and self.last_temp is not None:
+                # Establish the reference from the current measurement, not
+                # a filter still approaching it after startup or heating.
+                self.ref_temperature = self.last_temp
         else:
             self.ref_temperature = self.config_ref_temperature
         self.ref_temp_override = False
@@ -139,6 +144,9 @@ class ZThermalAdjuster:
             'z_adjust_off_above', 99999999.)
         self.max_z_adjust_mm = config.getfloat(
             'max_z_adjustment', 99999999., minval=0.)
+        # Keep legacy freeze-on-disable behaviour unless the configuration
+        # explicitly requests uncompensated calibration coordinates.
+        self.reset_on_disable = config.getboolean('reset_on_disable', False)
 
         # A sensor_type in the main section selects the original
         # single-sensor configuration. Otherwise named source sections are
@@ -328,6 +336,10 @@ class ZThermalAdjuster:
                     source.handle_z_homing()
                 self._update_multi_model_locked()
         self.z_adjust_mm = 0.
+        self.last_z_adjust_mm = 0.
+        # gcode_move may have handled this event before the thermal state
+        # was reset. Refresh its inverse position with the new zero bias.
+        self.printer.lookup_object('gcode_move').reset_last_position()
 
     def calc_adjust(self, pos):
         'Z adjustment calculation'
@@ -357,20 +369,72 @@ class ZThermalAdjuster:
 
     def get_position(self):
         position = self.calc_unadjust(self.next_transform.get_position())
-        self.last_position = self.calc_adjust(position)
+        # Reading a position must not apply a new temperature correction.
+        self.last_position = list(position)
         return position
 
     def move(self, newpos, speed):
-        # don't apply to extrude only moves or when disabled
-        if (newpos[0:2] == self.last_position[0:2]
+        # Only an extrusion-only move keeps the previous correction. A Z-only
+        # approach must update it exactly as an XY approach at the same Z.
+        if (newpos[0:3] == self.last_position[0:3]
                 or not self.adjust_enable):
             z = newpos[2] + self.last_z_adjust_mm
             adjusted_pos = [newpos[0], newpos[1], z, newpos[3]]
             self.next_transform.move(adjusted_pos, speed)
         else:
+            previous_adjust = (self.z_adjust_mm, self.last_z_adjust_mm)
             adjusted_pos = self.calc_adjust(newpos)
-            self.next_transform.move(adjusted_pos, speed)
+            try:
+                self.next_transform.move(adjusted_pos, speed)
+            except Exception:
+                # A rejected move did not apply the new bias to the machine.
+                self.z_adjust_mm, self.last_z_adjust_mm = previous_adjust
+                raise
         self.last_position[:] = newpos
+
+    def capture_state(self):
+        ("Save the caller's reference model and applied bias for "
+         "calibration.")
+        with self.lock:
+            state = {
+                'enabled': self.adjust_enable,
+                'applied': self.z_adjust_mm,
+                'last_applied': self.last_z_adjust_mm,
+            }
+            if self.legacy_mode:
+                state['legacy'] = (self.ref_temperature,
+                                   self.ref_temp_override, self.temp_coeff)
+            else:
+                state['sources'] = {
+                    name: (source.ref_temperature, source.ref_temp_override,
+                           source.temp_coeff)
+                    for name, source in self.sources.items()
+                }
+            return state
+
+    def restore_state(self, state):
+        """Restore calibration state without commanding a physical move."""
+        with self.lock:
+            if self.legacy_mode:
+                (self.ref_temperature, self.ref_temp_override,
+                 self.temp_coeff) = state['legacy']
+                self._update_legacy_model_locked()
+            else:
+                for name, values in state['sources'].items():
+                    source = self.sources[name]
+                    reference, override, coefficient = values
+                    # A calibration may perform the first Z home. There was
+                    # no earlier reference to restore in that case; retain
+                    # the valid measurement established by the home.
+                    if reference is not None:
+                        source.ref_temperature = reference
+                    source.ref_temp_override = override
+                    source.temp_coeff = coefficient
+                self._update_multi_model_locked()
+            self.adjust_enable = state['enabled']
+            self.z_adjust_mm = state['applied']
+            self.last_z_adjust_mm = state['last_applied']
+        self.printer.lookup_object('gcode_move').reset_last_position()
 
     def temperature_callback(self, read_time, temp):
         'Called every time the legacy Z adjust thermistor is read'
@@ -404,9 +468,14 @@ class ZThermalAdjuster:
         return False, 'z_thermal_adjust: ' + ' '.join(source_stats)
 
     def _set_enable(self, enable):
-        if enable is None or enable == self.adjust_enable:
+        if enable is None:
+            return
+        reset = not enable and self.reset_on_disable
+        if enable == self.adjust_enable and not reset:
             return
         self.adjust_enable = bool(enable)
+        if reset:
+            self.z_adjust_mm = self.last_z_adjust_mm = 0.
         gcode_move = self.printer.lookup_object('gcode_move')
         gcode_move.reset_last_position()
 
