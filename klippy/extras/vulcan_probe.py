@@ -691,6 +691,12 @@ class VulcanProbe:
         toolhead.manual_move([None, None, clear_z], 20.)
         toolhead.wait_moves()
         if toolhead.get_extruder().get_name() == "extruder1":
+            # Native probing can leave an endpoint a few microns beyond an
+            # axis boundary. The public stow macro must retain its strict
+            # displayed-position checks, so stage the automatic mesh return
+            # inside the bed before asking it to retain that position.
+            toolhead.manual_move([300., 250., None], 50.)
+            toolhead.wait_moves()
             self._run_probe_macro("stow")
         self._verify_t0_frame(toolhead)
         toolhead.manual_move([None, None, max(20., toolhead.get_position()[2])],
