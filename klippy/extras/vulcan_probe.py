@@ -241,8 +241,7 @@ class VulcanProbe:
         print_stats = self.printer.lookup_object("print_stats", None)
         pause = self.printer.lookup_object("pause_resume", None)
         if ((print_stats is not None and
-             print_stats.get_status(eventtime)["state"]
-             in ("printing", "paused"))
+             print_stats.get_status(eventtime)["state"] in ("printing", "paused"))
                 or (pause is not None and
                     pause.get_status(eventtime)["is_paused"])):
             raise error('列印或暂停期间不能修改探针偏移。')
@@ -287,8 +286,7 @@ class VulcanProbe:
                 if staging is not None and os.path.exists(staging):
                     os.unlink(staging)
 
-        # The existing save_variables worker yields the Klipper reactor
-        # during IO.
+        # The existing save_variables worker yields the Klipper reactor during IO.
         self.saved.executor.submit(write_atomic)
         self.saved.allVariables = variables
 
@@ -382,6 +380,32 @@ class VulcanProbe:
                 "T1 Z 偏移不是有限数值，已取消探针操作。")
         return t1_z
 
+    def _verify_probe_thermal_disabled(self):
+        thermal = self.printer.lookup_object("z_thermal_adjust", None)
+        if thermal is None:
+            return
+        state = thermal.capture_state()
+        biases = (state["applied"], state["last_applied"])
+        if (state["enabled"] or any(not math.isfinite(value) or
+                abs(value) > 1.e-9 for value in biases)):
+            raise self._command_error(
+                '热补偿未完全停用，已取消探针量测。')
+
+    def _disable_probe_thermal(self):
+        if self.printer.lookup_object("z_thermal_adjust", None) is not None:
+            self.gcode.run_script_from_command("SET_Z_THERMAL_ADJUST ENABLE=0")
+        self._verify_probe_thermal_disabled()
+
+    def _restore_probe_thermal(self, thermal, state, returned_home=False):
+        if thermal is None:
+            return
+        restored = dict(state)
+        if returned_home:
+            # A completed high-Z home establishes a fresh, uncompensated
+            # machine position. Do not reintroduce a pre-home low-Z bias.
+            restored["applied"] = restored["last_applied"] = 0.
+        thermal.restore_state(restored)
+
     def _measure_zero_window(self, gcmd, toolhead, probe_speed, tolerance):
         self._localize_gcmd(gcmd)
         # The native homing helper reports machine-frame positions. The T1
@@ -410,6 +434,7 @@ class VulcanProbe:
         helper.z_min_position = 0.
         try:
             for sample in range(3):
+                self._verify_probe_thermal_disabled()
                 toolhead.manual_move([None, None, start_z],
                                      self.calibration_lift_speed)
                 toolhead.wait_moves()
@@ -417,14 +442,14 @@ class VulcanProbe:
                     raise gcmd.error(
                         '探针在 T0 基准 Z=5 mm 已触发，已取消校准并保留原偏移。')
                 try:
-                    result = native_probe.run_single_probe(
-                        self.probe, probe_cmd)
+                    result = native_probe.run_single_probe(self.probe, probe_cmd)
                 except self.printer.command_error as exc:
                     if "No trigger on probe" in str(exc):
                         raise gcmd.error(
                             '探针在 T0 基准 Z=5 至 0 mm 内未触发；'
                             '已停止下降并保留原偏移。')
                     raise
+                self._verify_probe_thermal_disabled()
                 raw_trigger_z = result.test_z
                 trigger_z = raw_trigger_z - t1_z
                 if (not math.isfinite(raw_trigger_z)
@@ -537,16 +562,14 @@ class VulcanProbe:
         thermal = self.printer.lookup_object("z_thermal_adjust", None)
         settings = move.get_status()
         mesh_before = mesh.z_mesh
-        thermal_before = (thermal.capture_state()
-                          if thermal is not None else None)
+        thermal_before = thermal.capture_state() if thermal is not None else None
         offsets = self.probe.get_offsets()
         target_xy = (300. - offsets[0], 250. - offsets[1])
         for i, value in enumerate(target_xy):
             if not self.axis_limits[i][0] <= value <= self.axis_limits[i][1]:
                 raise gcmd.error('平台中心的探针位置超出行程，已取消校准。')
         homing_helper = getattr(self.probe.mcu_probe, "homing_helper", None)
-        if (homing_helper is None
-                or not hasattr(homing_helper, "z_min_position")):
+        if homing_helper is None or not hasattr(homing_helper, "z_min_position"):
             raise gcmd.error('目前的探针模组不支援限制校准下降范围。')
         self.calibrating = True
         failure = None
@@ -560,26 +583,23 @@ class VulcanProbe:
                 "requested_rounds": rounds, "rounds": round_results,
                 "saved": False, "completed": False}
         homed_for_calibration = False
+        returned_home = False
         try:
             # Establish the T0 machine reference with no old mesh or applied
             # thermal bias; G28 must preserve this disabled state.
             mesh.set_mesh(None)
-            if thermal is not None:
-                self.gcode.run_script_from_command(
-                    "SET_Z_THERMAL_ADJUST ENABLE=0")
-            self.gcode.run_script_from_command(
-                "M220 S100\nM221 S100\nG28\nM400")
+            self._disable_probe_thermal()
+            self.gcode.run_script_from_command("M220 S100\nM221 S100\nG28\nM400")
             self._verify_t0_frame(toolhead)
             homed_for_calibration = True
             # Existing mesh and thermal compensation must not bias the fixed
             # T0 reference. Restore both after the final home.
             mesh.set_mesh(None)
-            if thermal is not None:
-                self.gcode.run_script_from_command(
-                    "SET_Z_THERMAL_ADJUST ENABLE=0")
+            self._disable_probe_thermal()
             self._run_probe_macro("deploy")
             if toolhead.get_extruder().get_name() != "extruder1":
                 raise gcmd.error('探针未切换至 T1，已取消校准。')
+            self._disable_probe_thermal()
             toolhead.manual_move([None, None, 20.], 20.)
             toolhead.manual_move(list(target_xy) + [None], 50.)
             toolhead.wait_moves()
@@ -613,15 +633,18 @@ class VulcanProbe:
                     if status["homed_axes"] != "xyz":
                         raise gcmd.error(
                             '校准中断后轴已失去归零，未执行自动返回。')
+                    self._disable_probe_thermal()
                     self._finish_zero_motion(toolhead)
+                    self._verify_probe_thermal_disabled()
+                    returned_home = True
             except Exception as exc:
                 failure = ('%s；返回失败：%s' % (failure, exc)
                            if failure else '校准返回失败：%s' % (exc,))
             try:
                 if not self.printer.is_shutdown():
                     mesh.set_mesh(mesh_before)
-                    if thermal is not None:
-                        thermal.restore_state(thermal_before)
+                    self._restore_probe_thermal(
+                        thermal, thermal_before, returned_home)
                     self.gcode.run_script_from_command(
                         "M220 S%.6f\nM221 S%.6f\n%s\n%s\nG1 F%.6f"
                         % (settings["speed_factor"] * 100.,
@@ -674,9 +697,9 @@ class VulcanProbe:
             "spread": max(measurements) - min(measurements),
             "previous_z_offset": offsets[2], "z_offset": values[2]}
 
-    def _restore_mesh_modes(self, settings, thermal, thermal_before):
-        if thermal is not None:
-            thermal.restore_state(thermal_before)
+    def _restore_mesh_modes(self, settings, thermal, thermal_before,
+                            returned_home=False):
+        self._restore_probe_thermal(thermal, thermal_before, returned_home)
         self.gcode.run_script_from_command(
             "M220 S%.6f\nM221 S%.6f\n%s\n%s\nG1 F%.6f"
             % (settings["speed_factor"] * 100.,
@@ -757,9 +780,12 @@ class VulcanProbe:
         averaging = self.probe.probe_session
         native_sample = averaging._probe
         def settled_sample(gcmd):
+            self._verify_probe_thermal_disabled()
             toolhead.wait_moves()
             toolhead.dwell(0.5)
-            return native_sample(gcmd)
+            result = native_sample(gcmd)
+            self._verify_probe_thermal_disabled()
+            return result
         # Add settling only for this operation; retain native averaging/retries.
         averaging._probe = settled_sample
         try:
@@ -797,25 +823,25 @@ class VulcanProbe:
                           thermal, thermal_before):
         # The final home runs only after the measured mesh is safely persisted.
         mesh.set_mesh(None)
-        if thermal is not None:
-            self.gcode.run_script_from_command("SET_Z_THERMAL_ADJUST ENABLE=0")
+        returned_home = False
         try:
+            self._disable_probe_thermal()
             self.gcode.run_script_from_command("G28\nM400")
             # Retain disabled compensation until the T0 frame and final
             # position have been verified, then restore the caller's mode.
-            if thermal is not None:
-                self.gcode.run_script_from_command(
-                    "SET_Z_THERMAL_ADJUST ENABLE=0")
+            self._disable_probe_thermal()
             self._verify_t0_frame(toolhead)
             toolhead.manual_move([300., 250., None], 50.)
             toolhead.wait_moves()
             position = toolhead.get_position()
             if abs(position[0] - 300.) > 0.01 or abs(position[1] - 250.) > 0.01:
                 raise self._command_error('最后归零后未正确返回 X300、Y250。')
+            returned_home = True
         finally:
             if not self.printer.is_shutdown():
                 mesh.set_mesh(new_mesh)
-                self._restore_mesh_modes(settings, thermal, thermal_before)
+                self._restore_mesh_modes(
+                    settings, thermal, thermal_before, returned_home)
 
     def _run_mesh_calibration(self, gcmd):
         self._localize_gcmd(gcmd)
@@ -830,16 +856,14 @@ class VulcanProbe:
             raise gcmd.error('尚有其他未保存的校准设定，请先完成保存再量测网格。')
         thermal = self.printer.lookup_object("z_thermal_adjust", None)
         settings = self.printer.lookup_object("gcode_move").get_status()
-        thermal_before = (thermal.capture_state()
-                          if thermal is not None else None)
+        thermal_before = thermal.capture_state() if thermal is not None else None
         offsets = self._validate(self.probe.get_offsets(), gcmd.error)
         t1_z = self._t1_z_offset()
         mesh_probe_z = offsets[2] + t1_z
         if not math.isfinite(mesh_probe_z):
             raise gcmd.error('探针与 T1 Z 偏移合并后不是有限数值。')
         homing_helper = getattr(self.probe.mcu_probe, "homing_helper", None)
-        if (homing_helper is None
-                or not hasattr(homing_helper, "z_min_position")):
+        if homing_helper is None or not hasattr(homing_helper, "z_min_position"):
             raise gcmd.error('目前的探针模组不支援限制量测下降范围。')
         autosave = configfile.autosave
         snapshot = (mesh.z_mesh, copy.deepcopy(mesh.pmgr.profiles),
@@ -857,8 +881,7 @@ class VulcanProbe:
         self.last_mesh_calibration = {
             "completed": False, "saved": False, "profile": "default",
             "error": None,
-            "probe_offsets": list(offsets),
-            "probe_speed": self.calibration_speed,
+            "probe_offsets": list(offsets), "probe_speed": self.calibration_speed,
             "effective_mesh_probe_z_offset": mesh_probe_z,
             "t1_z_offset": t1_z,
             "samples": 3, "tolerance": self.calibration_tolerance,
@@ -870,20 +893,16 @@ class VulcanProbe:
         new_mesh = None
         try:
             mesh.set_mesh(None)
-            if thermal is not None:
-                self.gcode.run_script_from_command(
-                    "SET_Z_THERMAL_ADJUST ENABLE=0")
-            self.gcode.run_script_from_command(
-                "M220 S100\nM221 S100\nG28\nM400")
+            self._disable_probe_thermal()
+            self.gcode.run_script_from_command("M220 S100\nM221 S100\nG28\nM400")
             self._verify_t0_frame(toolhead)
             homed = True
             # Keep the measurement frame uncompensated after homing as well.
-            if thermal is not None:
-                self.gcode.run_script_from_command(
-                    "SET_Z_THERMAL_ADJUST ENABLE=0")
+            self._disable_probe_thermal()
             self._run_probe_macro("deploy")
             if toolhead.get_extruder().get_name() != "extruder1":
                 raise gcmd.error('探针未切换至 T1，已取消网格校准。')
+            self._disable_probe_thermal()
             toolhead.manual_move([None, None, clearance], 20.)
             toolhead.wait_moves()
             if self._query_pin(toolhead):
@@ -894,8 +913,7 @@ class VulcanProbe:
             self.offset_helper.z_offset = mesh_probe_z
             try:
                 self._measure_mesh_with_settle(toolhead,
-                    "BED_MESH_CALIBRATE METHOD=automatic "
-                    "PROFILE=default ADAPTIVE=0 "
+                    "BED_MESH_CALIBRATE METHOD=automatic PROFILE=default ADAPTIVE=0 "
                     "HORIZONTAL_MOVE_Z=%.6f PROBE_SPEED=%.6f LIFT_SPEED=%.6f "
                     "SAMPLES=3 SAMPLES_RESULT=average SAMPLE_RETRACT_DIST=1 "
                     "SAMPLES_TOLERANCE=%.6f SAMPLES_TOLERANCE_RETRIES=2"
@@ -911,8 +929,7 @@ class VulcanProbe:
             if new_mesh is None or new_mesh.get_profile_name() != "default":
                 raise gcmd.error('原生网格量测未产生完整的 default 网格。')
             points = new_mesh.get_probed_matrix()
-            if (not points or any(not math.isfinite(z)
-                                  for row in points for z in row)):
+            if not points or any(not math.isfinite(z) for row in points for z in row):
                 raise gcmd.error('网格量测结果无效，未保存。')
             self.last_mesh_calibration = dict(self.last_mesh_calibration, **{
                 "point_count": sum(map(len, points)),
@@ -933,6 +950,7 @@ class VulcanProbe:
                                 self.printer.get_reactor().monotonic()
                                 )["homed_axes"] != "xyz":
                             raise gcmd.error('量测中断后轴已失去归零，未执行返回。')
+                        self._disable_probe_thermal()
                         self._finish_mesh_motion(toolhead)
             except Exception as exc:
                 failure = ('%s；安全返回失败：%s' % (failure, exc)
@@ -950,8 +968,7 @@ class VulcanProbe:
             mesh.set_mesh(new_mesh)
             self._save_mesh_config(configfile)
             committed = True
-            self.last_mesh_calibration = dict(
-                self.last_mesh_calibration, saved=True)
+            self.last_mesh_calibration = dict(self.last_mesh_calibration, saved=True)
             self._home_mesh_return(toolhead, mesh, new_mesh, settings,
                                    thermal, thermal_before)
             self.last_mesh_calibration = dict(self.last_mesh_calibration, **{
