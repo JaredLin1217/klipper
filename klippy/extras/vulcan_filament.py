@@ -2,6 +2,7 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
 import re
+import time
 
 TOOLS = ("extruder", "extruder1")
 ALIASES = {"T0": 0, "0": 0, "EXTRUDER": 0,
@@ -9,11 +10,17 @@ ALIASES = {"T0": 0, "0": 0, "EXTRUDER": 0,
 BOTH = ("BOTH", "ALL", "T0/T1")
 
 def scan_file(path):
-    """Read G-code in an IO worker; count tools that actually extrude."""
+    """Count extruding tools in a worker that yields CPU to the reactor."""
     used, selected, first = set(), set(), None
     tool, relative, last_e = 0, False, 0.
+    next_yield = time.monotonic() + .005
     with open(path, encoding="utf-8", errors="replace") as stream:
-        for line in stream:
+        for number, line in enumerate(stream):
+            # A CPU-heavy Python worker can starve the reactor despite the GIL
+            # switch interval. Bound each parsing burst and give it time to run.
+            if not (number & 127) and time.monotonic() >= next_yield:
+                time.sleep(.001)
+                next_yield = time.monotonic() + .005
             code = line.split(";", 1)[0].strip().upper()
             if not code:
                 continue
