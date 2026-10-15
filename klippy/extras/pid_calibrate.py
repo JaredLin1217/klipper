@@ -26,7 +26,15 @@ class PIDCalibrate:
         calibrate = ControlAutoTune(heater, target)
         old_control = heater.set_control(calibrate)
         try:
-            pheaters.set_temperature(heater, target, True)
+            pheaters.set_temperature(heater, target)
+            # Autotune owns completion; normal target tolerance may finish early.
+            if self.printer.get_start_args().get('debugoutput') is None:
+                reactor = self.printer.get_reactor()
+                eventtime = reactor.monotonic()
+                while (not self.printer.is_shutdown()
+                       and heater.check_busy(eventtime)):
+                    gcmd.respond_raw(pheaters._get_temp(eventtime))
+                    eventtime = reactor.pause(eventtime + 1.)
         except self.printer.command_error as e:
             heater.set_control(old_control)
             raise
