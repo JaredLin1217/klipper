@@ -12,14 +12,19 @@ class PIDCalibrate:
         gcode = self.printer.lookup_object('gcode')
         gcode.register_command('PID_CALIBRATE', self.cmd_PID_CALIBRATE,
                                desc=self.cmd_PID_CALIBRATE_help)
+    def get_status(self, eventtime):
+        return {'copy_to_supported': True}
     cmd_PID_CALIBRATE_help = "Run PID calibration test"
     def cmd_PID_CALIBRATE(self, gcmd):
         heater_name = gcmd.get('HEATER')
         target = gcmd.get_float('TARGET')
         write_file = gcmd.get_int('WRITE_FILE', 0)
+        copy_to = gcmd.get('COPY_TO', None)
         pheaters = self.printer.lookup_object('heaters')
         try:
             heater = pheaters.lookup_heater(heater_name)
+            copy_heater = (pheaters.lookup_heater(copy_to)
+                           if copy_to is not None else None)
         except self.printer.config_error as e:
             raise gcmd.error(str(e))
         self.printer.lookup_object('toolhead').get_last_move_time()
@@ -57,6 +62,14 @@ class PIDCalibrate:
         configfile.set(cfgname, 'pid_Kp', "%.3f" % (Kp,))
         configfile.set(cfgname, 'pid_Ki', "%.3f" % (Ki,))
         configfile.set(cfgname, 'pid_Kd', "%.3f" % (Kd,))
+        if copy_heater is not None and copy_heater is not heater:
+            copy_cfgname = copy_heater.get_name()
+            configfile.set(copy_cfgname, 'control', 'pid')
+            configfile.set(copy_cfgname, 'pid_Kp', "%.3f" % (Kp,))
+            configfile.set(copy_cfgname, 'pid_Ki', "%.3f" % (Ki,))
+            configfile.set(copy_cfgname, 'pid_Kd', "%.3f" % (Kd,))
+            gcmd.respond_info("PID parameters copied to %s for SAVE_CONFIG"
+                              % (copy_cfgname,))
 
 TUNE_PID_DELTA = 5.0
 

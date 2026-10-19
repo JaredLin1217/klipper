@@ -19,6 +19,16 @@ RANGE_CHECK_COUNT = 4
 class PrinterADCtoTemperature:
     def __init__(self, config, adc_convert):
         self.adc_convert = adc_convert
+        # Keep the native cadence unless this sensor explicitly opts in.
+        self.report_time = config.getfloat('adc_report_time', REPORT_TIME,
+                                           minval=0.100, maxval=REPORT_TIME)
+        self.sample_count = config.getint('adc_sample_count', SAMPLE_COUNT,
+                                           minval=SAMPLE_COUNT, maxval=16)
+        self.sample_time = config.getfloat('adc_sample_time', SAMPLE_TIME,
+                                           minval=SAMPLE_TIME)
+        if not (SAMPLE_TIME <= self.sample_time
+                and self.sample_count * self.sample_time <= self.report_time):
+            raise config.error('ADC acquisition window exceeds report interval')
         ppins = config.get_printer().lookup_object('pins')
         self.mcu_adc = ppins.setup_pin('adc', config.get('sensor_pin'))
         self.mcu_adc.setup_adc_callback(self.adc_callback)
@@ -27,15 +37,15 @@ class PrinterADCtoTemperature:
     def setup_callback(self, temperature_callback):
         self.temperature_callback = temperature_callback
     def get_report_time_delta(self):
-        return REPORT_TIME
+        return self.report_time
     def adc_callback(self, samples):
         read_time, read_value = samples[-1]
         temp = self.adc_convert.calc_temp(read_value)
-        self.temperature_callback(read_time + SAMPLE_COUNT * SAMPLE_TIME, temp)
+        self.temperature_callback(read_time + self.sample_count * self.sample_time, temp)
     def setup_minmax(self, min_temp, max_temp):
         arange = [self.adc_convert.calc_adc(t) for t in [min_temp, max_temp]]
         min_adc, max_adc = sorted(arange)
-        self.mcu_adc.setup_adc_sample(REPORT_TIME, SAMPLE_TIME, SAMPLE_COUNT,
+        self.mcu_adc.setup_adc_sample(self.report_time, self.sample_time, self.sample_count,
                                       minval=min_adc, maxval=max_adc,
                                       range_check_count=RANGE_CHECK_COUNT)
         self.diag_helper.setup_diag_minmax(min_temp, max_temp, min_adc, max_adc)

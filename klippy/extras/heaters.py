@@ -71,7 +71,8 @@ class Heater:
                          is not None)
         self.can_extrude = self.min_extrude_temp <= 0. or is_fileoutput
         self.max_power = config.getfloat('max_power', 1., above=0., maxval=1.)
-        self.min_pwm_change = self.max_power * MIN_PWM_CHANGE_RATIO
+        pwm_change_ratio = 0.01 if self.name == "extruder" else MIN_PWM_CHANGE_RATIO
+        self.min_pwm_change = self.max_power * pwm_change_ratio
         self.smooth_time = config.getfloat('smooth_time', 1., above=0.)
         self.temperature_wait_tolerance = config.getfloat(
             'temperature_wait_tolerance', 3., above=0.)
