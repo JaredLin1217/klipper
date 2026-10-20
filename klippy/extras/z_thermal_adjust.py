@@ -343,7 +343,18 @@ class ZThermalAdjuster:
 
     def calc_adjust(self, pos):
         'Z adjustment calculation'
-        if pos[2] < self.off_above_z:
+        height = pos[2]
+        head = self.printer.lookup_object('toolhead', None)
+        if (head is not None
+                and head.get_extruder().get_name() == 'extruder1'):
+            # T1's tool offset changes carriage Z, not printed layer height.
+            # Use the applied origin, including a deferred-save distinction,
+            # rather than the potentially newer value in save_variables.
+            origin = self.printer.lookup_object('gcode_move').homing_position[2]
+            if not math.isfinite(origin):
+                raise self.printer.command_error('Nonfinite T1 Z origin')
+            height -= origin
+        if height < self.off_above_z:
             if self.legacy_mode:
                 with self.lock:
                     self._update_legacy_model_locked()
