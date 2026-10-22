@@ -75,6 +75,8 @@ _CN_TO_TW.update(str.maketrans({
 
 class VulcanProbe:
     KEYS = ("probe_x_offset", "probe_y_offset", "probe_z_offset")
+    FRAME_KEY = "probe_offset_frame"
+    FRAME_T1 = "t1_relative"
 
     def __init__(self, config):
         self.printer = config.get_printer()
@@ -113,11 +115,23 @@ class VulcanProbe:
                                                    note_valid=False)
         if "probe:z_virtual_endstop" in z_pin:
             raise config.error(self._t('即时探针偏移功能需要保留独立的 Z 轴归零开关。'))
-        defaults = self.probe.get_offsets()
-        values = tuple(self.saved.allVariables.get(key, default)
-                       for key, default in zip(self.KEYS, defaults))
+        defaults_native = self.probe.get_offsets()
+        legacy_frame = self.saved.allVariables.get(self.FRAME_KEY) != self.FRAME_T1
+        if legacy_frame:
+            # Older releases persisted native Klipper probe X/Y signs.  The
+            # public frame now follows T1: nozzle/tool position relative to
+            # T0.  Migrate once, then keep the native conversion at _apply().
+            stored_native = tuple(self.saved.allVariables.get(key, default)
+                                  for key, default in zip(self.KEYS,
+                                                          defaults_native))
+            values = self._from_native(stored_native)
+        else:
+            defaults = self._from_native(defaults_native)
+            values = tuple(self.saved.allVariables.get(key, default)
+                           for key, default in zip(self.KEYS, defaults))
         values = self._validate(values, config.error)
-        if any(key not in self.saved.allVariables for key in self.KEYS):
+        if (legacy_frame or
+                any(key not in self.saved.allVariables for key in self.KEYS)):
             try:
                 self._persist(values)
             except Exception as exc:
@@ -220,14 +234,15 @@ class VulcanProbe:
         values = tuple(float(value) for value in values)
         if not all(math.isfinite(value) for value in values):
             raise error(self._t('探针偏移不可使用 NaN 或无限大。'))
-        if not 0. <= values[2] < self.move_z:
+        native = self._to_native(values)
+        if not 0. <= native[2] < self.move_z:
             raise error(self._t(
                 '探针 Z 偏移必须大于等于 0 且小于量测移动高度 %.3f mm。'
                 % (self.move_z,)))
         for i, axis in enumerate(("X", "Y")):
             low, high = self.axis_limits[i]
-            if (self.mesh_min[i] - values[i] < low or
-                    self.mesh_max[i] - values[i] > high):
+            if (self.mesh_min[i] - native[i] < low or
+                    self.mesh_max[i] - native[i] > high):
                 raise error(self._t(
                     '探针 %s 偏移会使目前网格量测位置超出行程。' % (axis,)))
         return values
@@ -258,6 +273,7 @@ class VulcanProbe:
     def _persist(self, values):
         variables = dict(self.saved.allVariables)
         variables.update(zip(self.KEYS, values))
+        variables[self.FRAME_KEY] = self.FRAME_T1
         if variables == self.saved.allVariables:
             return
         parser = configparser.ConfigParser()
@@ -291,9 +307,23 @@ class VulcanProbe:
         self.saved.allVariables = variables
 
     def _apply(self, values):
+        native = self._to_native(values)
         self.offset_helper.x_offset, self.offset_helper.y_offset,\
-            self.offset_helper.z_offset = values
-        self.virtual_endstop.position_endstop = values[2]
+            self.offset_helper.z_offset = native
+        self.virtual_endstop.position_endstop = native[2]
+
+    @staticmethod
+    def _to_native(values):
+        """Convert T1-style public offsets to Klipper probe offsets."""
+        return (-values[0], -values[1], values[2])
+
+    @classmethod
+    def _from_native(cls, values):
+        """Convert Klipper probe offsets to the public T1-style frame."""
+        return cls._to_native(values)
+
+    def _user_offsets(self):
+        return self._from_native(self.probe.get_offsets())
 
     def cmd_SET_PROBE_OFFSET(self, gcmd):
         self._localize_gcmd(gcmd)
@@ -307,7 +337,7 @@ class VulcanProbe:
             # blank X/Y/Z fields keep their existing values.
             return
         self._check_idle(gcmd.error)
-        values = list(self.probe.get_offsets())
+        values = list(self._user_offsets())
         for i, axis in enumerate(("X", "Y", "Z")):
             if axis in supplied:
                 try:
@@ -334,7 +364,7 @@ class VulcanProbe:
             z_offset = float("%.3f" % (
                 offsets[2] - result.bed_z + position.bed_z,))
             values = self._validate(
-                self.probe.get_offsets()[:2] + (z_offset,),
+                self._user_offsets()[:2] + (z_offset,),
                 self._command_error)
             try:
                 self._persist(values)
@@ -350,8 +380,8 @@ class VulcanProbe:
         )["homing_origin"].z
         if offset != 0.:
             values = self._validate(
-                self.probe.get_offsets()[:2] +
-                (float("%.3f" % (self.probe.get_offsets()[2] - offset,)),),
+                self._user_offsets()[:2] +
+                (float("%.3f" % (self._user_offsets()[2] - offset,)),),
                 gcmd.error)
             try:
                 self._persist(values)
@@ -564,6 +594,7 @@ class VulcanProbe:
         mesh_before = mesh.z_mesh
         thermal_before = thermal.capture_state() if thermal is not None else None
         offsets = self.probe.get_offsets()
+        user_offsets = self._user_offsets()
         target_xy = (300. - offsets[0], 250. - offsets[1])
         for i, value in enumerate(target_xy):
             if not self.axis_limits[i][0] <= value <= self.axis_limits[i][1]:
@@ -621,8 +652,8 @@ class VulcanProbe:
                     "rounds": list(round_results),
                     "trigger_heights": list(measurements)})
             values = self._validate(
-                offsets[:2] + (round(sum(measurements) /
-                                    len(measurements), 6),), gcmd.error)
+                user_offsets[:2] + (round(sum(measurements) /
+                                          len(measurements), 6),), gcmd.error)
         except Exception as exc:
             failure = str(exc)
         finally:
@@ -857,7 +888,8 @@ class VulcanProbe:
         thermal = self.printer.lookup_object("z_thermal_adjust", None)
         settings = self.printer.lookup_object("gcode_move").get_status()
         thermal_before = thermal.capture_state() if thermal is not None else None
-        offsets = self._validate(self.probe.get_offsets(), gcmd.error)
+        user_offsets = self._validate(self._user_offsets(), gcmd.error)
+        offsets = self.probe.get_offsets()
         t1_z = self._t1_z_offset()
         mesh_probe_z = offsets[2] + t1_z
         if not math.isfinite(mesh_probe_z):
@@ -881,7 +913,9 @@ class VulcanProbe:
         self.last_mesh_calibration = {
             "completed": False, "saved": False, "profile": "default",
             "error": None,
-            "probe_offsets": list(offsets), "probe_speed": self.calibration_speed,
+            "probe_offsets": list(user_offsets),
+            "native_probe_offsets": list(offsets),
+            "probe_speed": self.calibration_speed,
             "effective_mesh_probe_z_offset": mesh_probe_z,
             "t1_z_offset": t1_z,
             "samples": 3, "tolerance": self.calibration_tolerance,
@@ -993,7 +1027,7 @@ class VulcanProbe:
                 failure))
 
     def get_status(self, eventtime):
-        current = self.probe.get_offsets()
+        current = self._user_offsets()
         saved = tuple(self.saved.allVariables[key] for key in self.KEYS)
         return {"x_offset": current[0], "y_offset": current[1],
                 "z_offset": current[2], "saved_offsets": dict(zip(

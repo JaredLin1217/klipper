@@ -19,7 +19,9 @@ class VulcanToolOffsets:
         self.last_result = dict(saved=False, applied=False, deferred=False,
                                 error='')
         self.gcode.register_command('_VULCAN_TOOL_MESH', self.cmd_TOOL_MESH)
-        self.gcode.register_command('_VULCAN_SET_T1_OFFSET',
+        # Klipper's command lexer on x600hd splits command names at digits.
+        # Keep the private command name alphabetic so ``T1`` is not truncated.
+        self.gcode.register_command('_VULCAN_SET_REAR_OFFSET',
                                     self.cmd_SET_T1_OFFSET)
 
     def _t(self, tw, cn):
