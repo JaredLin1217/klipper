@@ -16,6 +16,17 @@ InputShaperCfg = collections.namedtuple(
 class ShaperError(Exception):
     pass
 
+def _validate_damping_ratio(damping_ratio, name='damping_ratio'):
+    if not math.isfinite(damping_ratio) or damping_ratio < 0. \
+            or damping_ratio >= 1.:
+        raise ShaperError("%s must be in the range [0, 1)" % name)
+    return damping_ratio
+
+def _validate_vibration_tolerance(v_tol, name='v_tol'):
+    if not math.isfinite(v_tol) or v_tol <= 0. or v_tol >= 1.:
+        raise ShaperError("%s must be in the range (0, 1)" % name)
+    return v_tol
+
 def get_none_shaper():
     return ([], [])
 
@@ -84,6 +95,10 @@ def get_mzv_shaper(shaper_freq, damping_ratio, n=3, t=0.0, tau=0.0):
 
 def get_ei_shaper(shaper_freq, damping_ratio,
                   v_tol=1./SHAPER_VIBRATION_REDUCTION):
+    if not math.isfinite(shaper_freq) or shaper_freq <= 0.:
+        raise ShaperError("shaper_freq must be positive")
+    _validate_damping_ratio(damping_ratio)
+    _validate_vibration_tolerance(v_tol)
     df = math.sqrt(1. - damping_ratio**2)
     t_d = 1. / (shaper_freq * df)
     dr = damping_ratio
@@ -101,6 +116,165 @@ def get_ei_shaper(shaper_freq, damping_ratio,
     A = [a1, a2, a3]
     T = [0., t2 * t_d, t_d]
     return (A, T)
+
+def _convolve_shapers(a1, t1, a2, t2, name):
+    pulses = sorted((ti + tj, ai * aj)
+                    for ti, ai in zip(t1, a1)
+                    for tj, aj in zip(t2, a2))
+    # Merge coincident times so the C helper receives strictly increasing T.
+    A, T = [], []
+    for t, a in pulses:
+        if T and abs(t - T[-1]) < 1e-12:
+            A[-1] += a
+        else:
+            T.append(t)
+            A.append(a)
+    if len(A) > 10:
+        raise ShaperError("%s produces more than 10 pulses" % name)
+    total = sum(A)
+    return ([a / total for a in A], T)
+
+def _get_composite_ei_params(damping_ratio, v_tol, damping2, v_tol2):
+    """Resolve the optional parameters for the second EI stage."""
+    damping2 = damping_ratio if damping2 is None else damping2
+    v_tol2 = v_tol if v_tol2 is None else v_tol2
+    _validate_damping_ratio(damping_ratio)
+    _validate_damping_ratio(damping2, 'damping2')
+    _validate_vibration_tolerance(v_tol)
+    _validate_vibration_tolerance(v_tol2, 'v_tol2')
+    return damping2, v_tol2
+
+def get_composite_ei_shaper(shaper_freq, damping_ratio, f2=0.,
+                            v_tol=1./SHAPER_VIBRATION_REDUCTION,
+                            damping2=None, v_tol2=None):
+    """Convolve two EI shapers to suppress two measured bands.
+
+    ``shaper_freq`` is the first EI center and ``f2`` is the second one.
+    ``v_tol`` and ``damping_ratio`` configure the first (usually low-frequency)
+    stage.  ``v_tol2`` and ``damping2`` optionally configure the second stage;
+    when omitted they inherit the first stage values.  EI x EI produces nine
+    pulses, within the native ten-pulse kinematic shaper limit.
+
+    The parser accepts named parameters in ``shaper_type_x``/``y``.  A formal
+    configuration therefore uses one ``[input_shaper]`` section, for example::
+
+        shaper_type_x: composite_ei(f2=161.3,v_tol=0.10)
+        shaper_freq_x: 25.0
+
+    This applies both notches to X; the same form can be used independently
+    for Y.  A second ``[input_shaper]`` section is not valid Klipper config.
+    """
+    if not math.isfinite(f2) or f2 <= 0.:
+        raise ShaperError("composite_ei requires a positive f2 parameter")
+    damping2, v_tol2 = _get_composite_ei_params(
+        damping_ratio, v_tol, damping2, v_tol2)
+    return _convolve_shapers(
+        *get_ei_shaper(shaper_freq, damping_ratio, v_tol),
+        *get_ei_shaper(f2, damping2, v_tol2), "composite_ei")
+
+def get_composite_ei_zvd_shaper(shaper_freq, damping_ratio,
+                                f2=0., damping2=0.1):
+    """Convolve a low-frequency EI with a separately damped high ZVD."""
+    if not math.isfinite(f2) or f2 <= 0.:
+        raise ShaperError("composite_ei_zvd requires a positive f2 parameter")
+    return _convolve_shapers(
+        *get_ei_shaper(shaper_freq, damping_ratio),
+        *get_zvd_shaper(f2, damping2), "composite_ei_zvd")
+
+def get_composite_ei_zv_shaper(shaper_freq, damping_ratio,
+                               f2=0., damping2=0.1):
+    """Convolve a low-frequency EI with a separately damped high ZV."""
+    if not math.isfinite(f2) or f2 <= 0.:
+        raise ShaperError("composite_ei_zv requires a positive f2 parameter")
+    return _convolve_shapers(
+        *get_ei_shaper(shaper_freq, damping_ratio),
+        *get_zv_shaper(f2, damping2), "composite_ei_zv")
+
+def get_composite_ei_ei_shaper(shaper_freq, damping_ratio,
+                               f2=0., damping2=0.1,
+                               v_tol=1./SHAPER_VIBRATION_REDUCTION,
+                               v_tol2=None):
+    """Convolve a low-frequency EI with a separately damped high EI."""
+    if not math.isfinite(f2) or f2 <= 0.:
+        raise ShaperError("composite_ei_ei requires a positive f2 parameter")
+    damping2, v_tol2 = _get_composite_ei_params(
+        damping_ratio, v_tol, damping2, v_tol2)
+    return _convolve_shapers(
+        *get_ei_shaper(shaper_freq, damping_ratio, v_tol),
+        *get_ei_shaper(f2, damping2, v_tol2), "composite_ei_ei")
+
+def get_composite_zvd_zvd_shaper(shaper_freq, damping_ratio,
+                                 f2=0., damping2=0.1):
+    """Convolve low- and high-frequency ZVD shapers."""
+    if not math.isfinite(f2) or f2 <= 0.:
+        raise ShaperError("composite_zvd_zvd requires a positive f2 parameter")
+    return _convolve_shapers(
+        *get_zvd_shaper(shaper_freq, damping_ratio),
+        *get_zvd_shaper(f2, damping2), "composite_zvd_zvd")
+
+def get_composite_zvd_zv_shaper(shaper_freq, damping_ratio,
+                                f2=0., damping2=0.1):
+    """Convolve a low-frequency ZVD with a separately damped high ZV."""
+    if not math.isfinite(f2) or f2 <= 0.:
+        raise ShaperError("composite_zvd_zv requires a positive f2 parameter")
+    return _convolve_shapers(
+        *get_zvd_shaper(shaper_freq, damping_ratio),
+        *get_zv_shaper(f2, damping2), "composite_zvd_zv")
+
+def get_composite_zvd_ei_shaper(shaper_freq, damping_ratio,
+                                f2=0., damping2=0.1):
+    """Convolve a low-frequency ZVD with a separately damped high EI."""
+    if not math.isfinite(f2) or f2 <= 0.:
+        raise ShaperError("composite_zvd_ei requires a positive f2 parameter")
+    return _convolve_shapers(
+        *get_zvd_shaper(shaper_freq, damping_ratio),
+        *get_ei_shaper(f2, damping2), "composite_zvd_ei")
+
+# Hardware-specific weighted profiles produced by the constrained two-band
+# optimizer.  They keep nine non-negative pulses and sum to one.  The
+# shaper_freq/damping arguments are retained for the native interface, while
+# the measured Vulcan600 pulse timing is intentionally fixed for validation.
+_COMPOSITE_FIT_X_AMPLITUDES = [
+    0.045510457572373576, 0.12520731748866187,
+    0.08407763817595743, 0.12227822382934686,
+    0.24585272614752024, 0.12227822356234884,
+    0.08407763830927023, 0.12520731748525,
+    0.045510457429270956,
+]
+_COMPOSITE_FIT_X_TIMES = [
+    0.0, 0.0031036960590313627, 0.006207392118062725,
+    0.019866118028641223, 0.022969814087672586,
+    0.02607351014670395, 0.03973223605728245,
+    0.04283593211631381, 0.04593962817534517,
+]
+_COMPOSITE_FIT_Y_AMPLITUDES = [
+    0.055067223570137165, 0.12396603590780393,
+    0.07365476692260446, 0.12385055678293193,
+    0.24692284485976598, 0.12385054631659678,
+    0.07365477214767573, 0.1239660354274752,
+    0.055067218065008784,
+]
+_COMPOSITE_FIT_Y_TIMES = [
+    0.0, 0.002994175683742577, 0.005988351367485154,
+    0.010561733635480144, 0.01355590931922272,
+    0.016550085002965297, 0.02112346727096029,
+    0.024117642954702867, 0.02711181863844544,
+]
+
+def _get_weighted_profile(amplitudes, times):
+    return (list(amplitudes), list(times))
+
+def get_composite_fit_x_shaper(shaper_freq, damping_ratio, profile=1):
+    if profile != 1:
+        raise ShaperError("composite_fit_x supports profile=1 only")
+    return _get_weighted_profile(_COMPOSITE_FIT_X_AMPLITUDES,
+                                 _COMPOSITE_FIT_X_TIMES)
+
+def get_composite_fit_y_shaper(shaper_freq, damping_ratio, profile=1):
+    if profile != 1:
+        raise ShaperError("composite_fit_y supports profile=1 only")
+    return _get_weighted_profile(_COMPOSITE_FIT_Y_AMPLITUDES,
+                                 _COMPOSITE_FIT_Y_TIMES)
 
 def _get_shaper_from_expansion_coeffs(shaper_freq, damping_ratio, t, a):
     tau = 1. / shaper_freq
@@ -158,10 +332,46 @@ INPUT_SHAPERS = [
                    min_freq=48., max_damping_ratio=0.2),
 ]
 
+COMPOSITE_EI_CFG = InputShaperCfg(
+    name='composite_ei', init_func=get_composite_ei_shaper,
+    min_freq=29., max_damping_ratio=0.4)
+COMPOSITE_EI_ZVD_CFG = InputShaperCfg(
+    name='composite_ei_zvd', init_func=get_composite_ei_zvd_shaper,
+    min_freq=29., max_damping_ratio=0.4)
+COMPOSITE_EI_ZV_CFG = InputShaperCfg(
+    name='composite_ei_zv', init_func=get_composite_ei_zv_shaper,
+    min_freq=29., max_damping_ratio=0.4)
+COMPOSITE_EI_EI_CFG = InputShaperCfg(
+    name='composite_ei_ei', init_func=get_composite_ei_ei_shaper,
+    min_freq=29., max_damping_ratio=0.4)
+COMPOSITE_ZVD_ZVD_CFG = InputShaperCfg(
+    name='composite_zvd_zvd', init_func=get_composite_zvd_zvd_shaper,
+    min_freq=29., max_damping_ratio=0.99)
+COMPOSITE_ZVD_ZV_CFG = InputShaperCfg(
+    name='composite_zvd_zv', init_func=get_composite_zvd_zv_shaper,
+    min_freq=29., max_damping_ratio=0.99)
+COMPOSITE_ZVD_EI_CFG = InputShaperCfg(
+    name='composite_zvd_ei', init_func=get_composite_zvd_ei_shaper,
+    min_freq=29., max_damping_ratio=0.99)
+COMPOSITE_FIT_X_CFG = InputShaperCfg(
+    name='composite_fit_x', init_func=get_composite_fit_x_shaper,
+    min_freq=1., max_damping_ratio=0.99)
+COMPOSITE_FIT_Y_CFG = InputShaperCfg(
+    name='composite_fit_y', init_func=get_composite_fit_y_shaper,
+    min_freq=1., max_damping_ratio=0.99)
+COMPOSITE_SHAPERS = [COMPOSITE_EI_CFG, COMPOSITE_EI_ZVD_CFG,
+                     COMPOSITE_EI_ZV_CFG, COMPOSITE_EI_EI_CFG,
+                     COMPOSITE_ZVD_ZVD_CFG, COMPOSITE_ZVD_ZV_CFG,
+                     COMPOSITE_ZVD_EI_CFG, COMPOSITE_FIT_X_CFG,
+                     COMPOSITE_FIT_Y_CFG]
+
 def get_shaper_cfg(shaper_name):
     m = re.match(r"(\w+)\s*\((.*)\)$", shaper_name)
     if m:
         shaper_name = m.group(1)
+    for s in COMPOSITE_SHAPERS:
+        if shaper_name == s.name:
+            return s
     for s in INPUT_SHAPERS:
         if shaper_name == s.name:
             return s
@@ -187,6 +397,10 @@ def init_shaper(shaper_name, shaper_freq, damping_ratio, error=None):
                     raise ShaperError("Mixing named and non-named shaper"
                                       " parameters is not supported")
         for s in INPUT_SHAPERS:
+            if shaper_name == s.name:
+                return s.init_func(shaper_freq, damping_ratio,
+                                   *args_l, **args_kv)
+        for s in COMPOSITE_SHAPERS:
             if shaper_name == s.name:
                 return s.init_func(shaper_freq, damping_ratio,
                                    *args_l, **args_kv)
