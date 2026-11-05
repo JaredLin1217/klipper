@@ -80,7 +80,7 @@ class VulcanProbe:
 
     def __init__(self, config):
         self.printer = config.get_printer()
-        self.locale = self._detect_locale(config)
+        self.locale = "EN"
         self.gcode = self.printer.lookup_object("gcode")
         self.probe = self.printer.load_object(config, "probe")
         self.saved = self.printer.load_object(config, "save_variables")
@@ -176,22 +176,6 @@ class VulcanProbe:
                 self.gcode.register_command(
                     name, macro.cmd, when_not_ready=True, desc=macro.cmd_desc)
 
-    @staticmethod
-    def _detect_locale(config):
-        """Detect the locale from an explicit option or paired macro names."""
-        explicit = config.get("locale", None)
-        if explicit:
-            locale = str(explicit).strip().upper()
-            if locale in ("CN", "TW"):
-                return locale
-        fileconfig = getattr(config, "fileconfig", None)
-        if fileconfig is not None:
-            if fileconfig.has_section("gcode_macro 探針_伸出"):
-                return "TW"
-            if fileconfig.has_section("gcode_macro 探针_伸出"):
-                return "CN"
-        return "CN"
-
     def _t(self, text):
         text = str(text)
         return text.translate(_CN_TO_TW) if self.locale == "TW" else text
@@ -214,8 +198,8 @@ class VulcanProbe:
 
     def _run_probe_macro(self, action):
         names = {
-            "deploy": ('探针_伸出', '探針_伸出'),
-            "stow": ('探针_收回', '探針_收回'),
+            "deploy": ("PROBE_EXTEND",),
+            "stow": ("PROBE_RETRACT",),
         }.get(action)
         if names is None:
             raise self._command_error('未知的探针动作：%s' % action)
@@ -225,7 +209,8 @@ class VulcanProbe:
                 self.gcode.run_script_from_command(name + "\nM400")
                 return
         raise self._command_error(
-            '找不到探针%s宏（CN/TW）' % ('伸出' if action == "deploy" else '收回'))
+            'Probe %s macro was not found.' % (
+                'extend' if action == "deploy" else 'retract'))
 
     def _validate(self, values, error):
         if any(isinstance(value, bool) or

@@ -14,8 +14,7 @@ class VulcanToolOffsets:
         self.gcode = self.printer.lookup_object('gcode')
         self.saved = self.printer.load_object(config, 'save_variables')
         self.gcode_move = self.printer.load_object(config, 'gcode_move')
-        self.locale = ('TW' if config.fileconfig.has_section(
-            'gcode_macro 後噴頭_偏移設定') else 'CN')
+        self.locale = 'EN'
         self.last_result = dict(saved=False, applied=False, deferred=False,
                                 error='')
         self.gcode.register_command('_VULCAN_TOOL_MESH', self.cmd_TOOL_MESH)

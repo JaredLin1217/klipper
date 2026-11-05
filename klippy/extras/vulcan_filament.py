@@ -98,17 +98,13 @@ class VulcanFilament:
     def _status(self, name):
         obj = self.printer.lookup_object(name, None)
         return {} if obj is None else obj.get_status(self.reactor.monotonic())
-    def _macro(self, primary, fallback):
-        """Resolve a localized macro name from the active config."""
-        for name in (primary, fallback):
-            if self.printer.lookup_object(
-                    "gcode_macro " + name, None) is not None:
-                return name
-        return primary
-    def _macro_status(self, primary, fallback):
-        return self._status("gcode_macro " + self._macro(primary, fallback))
-    def _run_macro(self, primary, fallback, suffix=""):
-        self._run(self._macro(primary, fallback) + suffix)
+    def _macro(self, name):
+        """Return the canonical English macro identifier."""
+        return name
+    def _macro_status(self, name):
+        return self._status("gcode_macro " + name)
+    def _run_macro(self, name, suffix=""):
+        self._run(name + suffix)
     def _active_tool(self):
         name = self._status("toolhead").get("extruder", "extruder")
         return 1 if name == "extruder1" else 0
@@ -179,7 +175,7 @@ class VulcanFilament:
         return passed
     def _prompt(self, missing):
         names = "/".join("T%d" % tool for tool in sorted(missing))
-        confirm = self._macro("提示_确认", "提示_確認")
+        confirm = self._macro("PROMPT_CONFIRM")
         self._run('RESPOND TYPE=command MSG="action:prompt_begin 斷料警告"')
         self._run('RESPOND TYPE=command MSG="action:prompt_text %s '
                   '無耗材或感測器不存在；請完成進料，'
@@ -281,7 +277,7 @@ class VulcanFilament:
             if not self._check({target}, preflight=True):
                 self.pending_tool = target
                 return
-        self._run_macro("_工具切换", "_工具切換", " TOOL=" + TOOLS[target])
+        self._run_macro("_TOOL_CHANGE", suffix=" TOOL=" + TOOLS[target])
     def cmd_HOME(self, gcmd):
         old = self.homing
         self.homing = True
@@ -294,10 +290,10 @@ class VulcanFilament:
         finally:
             self.homing = old
     def cmd_START(self, gcmd):
-        if self._macro_status("_冷模式状态", "_冷模式狀態").get("enabled", False):
+        if self._macro_status("_COLD_MODE_STATUS").get("enabled", False):
             raise gcmd.error("冷模式仍為啟用狀態，請先停用再開始列印")
-        reset = self._macro("_重置取消列印保护", "_重置取消列印保護")
-        park = self._macro("_暂停取消停靠", "_暫停取消停靠")
+        reset = self._macro("_RESET_CANCEL_PRINT_PROTECTION")
+        park = self._macro("_PAUSE_UNPARK")
         self._run(reset)
         self._run("SET_GCODE_VARIABLE MACRO=%s "
                   "VARIABLE=has_parked VALUE=0" % park)
@@ -319,8 +315,8 @@ class VulcanFilament:
                 if stage == 0:
                     self._run("G90\nM83\nG28")
                 elif stage == 1:
-                    self._run_macro("_工具切换", "_工具切換",
-                                    " TOOL=" + TOOLS[self.first_tool])
+                    self._run_macro("_TOOL_CHANGE",
+                                    suffix=" TOOL=" + TOOLS[self.first_tool])
                     if self.printer.lookup_object("bed_mesh", None):
                         self._run("BED_MESH_PROFILE LOAD=default")
                     self._run("M104 S%s\nM140 S%s" % (
@@ -386,7 +382,7 @@ class VulcanFilament:
                 pause.send_resume_command()
             else:
                 resume = self._status("gcode_macro RESUME")
-                client = self._macro_status("_用户端设定", "_用戶端設定")
+                client = self._macro_status("_CLIENT_SETTINGS")
                 last = resume.get("last_extruder_temp", {})
                 active = TOOLS[self._active_tool()]
                 if (not self.no_park_pause and last.get("restore")
@@ -411,7 +407,7 @@ class VulcanFilament:
                         self._run(user)
                     if not self._check(needed):
                         return
-                    self._run_macro("_用户端挤出", "_用戶端擠出")
+                    self._run_macro("_CLIENT_EXTRUDE")
                 velocity = gcmd.get_float("VELOCITY",
                                           client.get("speed_move", 50.),
                                           above=0.)
@@ -419,17 +415,18 @@ class VulcanFilament:
                 self._run("RESUME_BASE VELOCITY=%s" % velocity)
                 if self.pending_tool is not None:
                     target = self.pending_tool
-                    self._run_macro("_工具切换", "_工具切換", " TOOL=" + TOOLS[target])
+                    self._run_macro("_TOOL_CHANGE",
+                                    suffix=" TOOL=" + TOOLS[target])
                     self.pending_tool = None
             self.blocked = set()
             self.preflight = False
             self.no_park_pause = False
-            park = self._macro("_暂停取消停靠", "_暫停取消停靠")
+            park = self._macro("_PAUSE_UNPARK")
             self._run("SET_GCODE_VARIABLE MACRO=%s "
                       "VARIABLE=has_parked VALUE=0" % park)
             self._run("SET_GCODE_VARIABLE MACRO=RESUME "
                       "VARIABLE=idle_state VALUE=False")
-            self._run(self._macro("状态_列印中", "狀態_列印中"))
+            self._run(self._macro("STATUS_PRINTING"))
         finally:
             self.resuming = False
     def cmd_RESET(self, gcmd):
